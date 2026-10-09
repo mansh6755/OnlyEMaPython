@@ -86,8 +86,9 @@ class EMATrendStrategyWorker:
 
 
 def main() -> None:
-    logger.info("EMA-only trading runner active.")
-    logger.info("Non-EMA strategy workers have been removed from this build.")
+    from Dependencies.fyers_ema_runner import run_ema_runner
+
+    run_ema_runner(EMA_LOGIC, EMA_STRATEGY_CONFIG)
 
 
 if __name__ == "__main__":

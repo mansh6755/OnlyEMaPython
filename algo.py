@@ -31,13 +31,12 @@ The commands:
       python algo.py backtest --strategy renko --data "Backtest Outputs/nifty_renko_futures_5y_1min_data.csv"
       python algo.py backtest --strategy goldmine --data five_min.csv --dataset nifty
 
-  run          Start the multithreaded front-test master (all strategies at once).
-               Paper by default; goes live only if you configured a broker in
-               Dependencies/.env (see the README). Reads ALL its settings from
-               that .env, so this command takes no options of its own.
+    run          Start the EMA strategy with Fyers market data and option contracts.
+                             Paper by default; live orders require LIVE_TRADING_ENABLED=true
+                             in Dependencies/.env. Reads its settings from that .env.
       python algo.py run
 
-  setup-token  One-time DhanHQ login that writes a fresh access token into .env.
+    setup-token  One-time Fyers OAuth login that writes an access token into .env.
                Interactive (opens a browser / asks you to paste a code).
       python algo.py setup-token
 
@@ -120,7 +119,7 @@ BROKER_DIAGNOSTICS = {
 
 # Commands that always map to exactly one script (no selector needed).
 MASTER_SCRIPT = "nifty_multi_strategy_master.py"
-TOKEN_SETUP_SCRIPT = "Dependencies/dhan_token_setup.py"
+TOKEN_SETUP_SCRIPT = "Dependencies/fyers_token_setup.py"
 CHECK_ENV_SCRIPT = "Dependencies/check_env_config.py"
 
 
@@ -190,12 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "run",
-        help="Start the multithreaded front-test master (paper by default; live per Dependencies/.env).",
+        help="Start the Fyers-backed EMA runner (paper by default; live is opt-in).",
     )
 
     sub.add_parser(
         "setup-token",
-        help="One-time interactive DhanHQ login that writes a fresh token into .env.",
+        help="One-time interactive Fyers OAuth login that writes a token into .env.",
     )
 
     diagnose = sub.add_parser(

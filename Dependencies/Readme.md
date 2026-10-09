@@ -1,5 +1,24 @@
 # Dependencies
 
+## Active EMA runner
+`python algo.py run` starts the EMA strategy in [nifty_multi_strategy_master.py](../nifty_multi_strategy_master.py).
+It gets NIFTY one-minute candles and option contracts from Fyers, resamples completed
+five-minute bars, and applies the shared EMA signal logic. Bullish signals buy one
+ATM CE and bearish signals buy one ATM PE for the first listed expiry in the next
+ISO week. Contract symbols and lot sizes come from Fyers' NSE derivatives master.
+
+The runner is paper-only by default. To enable real orders, configure the Fyers
+credentials below and explicitly set `LIVE_TRADING_ENABLED=true` in the ignored
+`Dependencies/.env` file. Live startup refuses to proceed if the Fyers account has
+an open order, position, or indeterminate account response. A partial or ambiguous
+order result stops the runner for manual reconciliation.
+
+Set up the token with `python algo.py setup-token`. Historical Dhan extractors and
+broker diagnostics remain separate utilities; they are not used by this EMA runner.
+
+The remaining sections describe retained shared utilities and legacy broker
+integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
+
 Shared configuration, the safety/data primitives the front-test master imports on
 every run (paper or live), and the live-execution layer. The broker subfolders only
 come into play when live trading is switched on.
