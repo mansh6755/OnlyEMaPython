@@ -11,6 +11,8 @@ env/
 # Environment / secrets
 .env
 .env.*
+# Local persistent Fyers access token; Railway should use a mounted volume.
+Dependencies/.fyers_access_token
 # Shoonya/Noren session token, if ever written to disk (broker session secret)
 shoonyakey.txt
 # Google Sheets OAuth client + cached token (credentials for the EOD P&L export)

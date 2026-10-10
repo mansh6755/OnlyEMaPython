@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as day_time
@@ -20,6 +21,12 @@ from Dependencies.broker_contract import OrderStatus
 from Dependencies.fyers_api import FyersAPI, FyersAPIError
 from Dependencies.fyers_execution import FyersExecutionClient
 from Dependencies.fyers_options import FyersOptionContract
+from Dependencies.fyers_telegram_auth import (
+    FyersTelegramAuthService,
+    load_persisted_access_token,
+)
+from Dependencies.secret_redaction import environment_secrets, redact_text
+from Dependencies.telegram_notifier import TelegramNotifier
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
@@ -35,6 +42,63 @@ class ActivePosition:
     entry_underlying: float
     stop_underlying: float
     entry_option_price: float
+    placed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedPosition:
+    exit_option_price: float
+    pnl: float
+    placed_at: datetime
+
+
+def _format_pnl(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}₹{abs(value):.2f}"
+
+
+def _display_instrument(contract: FyersOptionContract) -> str:
+    return f"NIFTY-{contract.expiry:%b%Y}-{contract.strike:g}-{contract.option_type}"
+
+
+def _format_entry_alert(position: ActivePosition, lots: int, mode: str) -> str:
+    contract = position.contract
+    return (
+        f"🚀 ENTRY · EMA\n"
+        f"Direction: {position.direction}\n"
+        f"Instrument: BUY {_display_instrument(contract)}\n"
+        f"  Entry: ₹{position.entry_option_price:.2f}\n"
+        f"Qty: {position.quantity} ({lots} lot(s) x {contract.lot_size})\n"
+        f"[{mode}] {position.placed_at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def _format_exit_alert(
+    position: ActivePosition,
+    closed: ClosedPosition,
+    reason: str,
+    mode: str,
+) -> str:
+    display_reason = "TIME_CUTOFF" if reason == "SQUARE_OFF" else reason
+    return (
+        f"🏁 EXIT · EMA ({display_reason})\n"
+        f"Direction: {position.direction}\n"
+        f"Instrument: SELL {_display_instrument(position.contract)}\n"
+        f"  Entry: ₹{position.entry_option_price:.2f} → Exit: ₹{closed.exit_option_price:.2f}\n"
+        f"Qty: {position.quantity} (lot size {position.contract.lot_size})\n"
+        f"⚪ P&L: {_format_pnl(closed.pnl)}\n"
+        f"[{mode}] {closed.placed_at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def _format_eod_alert(realized_pnl: float, trade_count: int, mode: str, at: datetime) -> str:
+    return (
+        f"📊 End-of-Day P&L [{mode}]\n"
+        f"{at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST\n"
+        f"EMA [{mode}]: {_format_pnl(realized_pnl)} ({trade_count} trade(s))\n"
+        "──────────\n"
+        f"Total: {_format_pnl(realized_pnl)} ({trade_count} trade(s))"
+    )
 
 
 def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
@@ -60,6 +124,32 @@ def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.D
     counts = frame["close"].resample("5min", label="left", closed="left").count()
     bars = bars[(counts == 5) & bars["close"].notna()]
     return bars.reset_index(names="timestamp")
+
+
+def _format_error_alert(context: str, error: Exception, mode: str) -> str:
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    details = redact_text(details, environment_secrets(os.environ)).strip()
+    if len(details) > 2800:
+        details = "[Earlier traceback details truncated]\n" + details[-2800:]
+    return (
+        f"🚨 ERROR · EMA\n"
+        f"Mode: {mode}\n"
+        f"Context: {context}\n"
+        f"Time: {datetime.now(IST):%Y-%m-%d %H:%M:%S} IST\n\n"
+        f"{details}"
+    )
+
+
+def _notify_runner_error(
+    notifier: TelegramNotifier,
+    context: str,
+    error: Exception,
+    mode: str,
+) -> None:
+    notifier.notify_error(
+        f"{context}:{type(error).__name__}",
+        _format_error_alert(context, error, mode),
+    )
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -98,8 +188,10 @@ def _close_position(
     live_enabled: bool,
     product_type: str,
     reason: str,
-) -> float:
+    mark_price: float | None = None,
+) -> ClosedPosition:
     if live_enabled:
+        placed_at = datetime.now(IST)
         result = execution.place_market_order(
             position.contract.symbol,
             "SELL",
@@ -111,9 +203,10 @@ def _close_position(
             raise RuntimeError("Fyers exit was not fully confirmed; stop and reconcile the account.")
         exit_price = result.average_fill_price
         if exit_price <= 0:
-            exit_price = api.quote_ltp(position.contract.symbol)
+            exit_price = mark_price or api.quote_ltp(position.contract.symbol)
     else:
-        exit_price = api.quote_ltp(position.contract.symbol)
+        placed_at = datetime.now(IST)
+        exit_price = mark_price or api.quote_ltp(position.contract.symbol)
     trade_pnl = (exit_price - position.entry_option_price) * position.quantity
     LOGGER.info(
         "EMA exit confirmed | symbol=%s | reason=%s | pnl=%.2f",
@@ -121,7 +214,7 @@ def _close_position(
         reason,
         trade_pnl,
     )
-    return trade_pnl
+    return ClosedPosition(exit_price, trade_pnl, placed_at)
 
 
 def _live_preflight(client: FyersExecutionClient) -> None:
@@ -139,8 +232,52 @@ def _live_preflight(client: FyersExecutionClient) -> None:
 
 def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
     load_dotenv(ENV_FILE, override=False)
-    app_id = os.getenv("FYERS_APP_ID", "").strip()
-    access_token = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
+    notifier = TelegramNotifier.from_environment()
+    mode = "LIVE" if os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true" else "PAPER"
+    auth_service: FyersTelegramAuthService | None = None
+    try:
+        app_id = os.getenv("FYERS_APP_ID", "").strip()
+        token_file_value = os.getenv("FYERS_TOKEN_FILE", "").strip()
+        token_file = (
+            Path(token_file_value).expanduser()
+            if token_file_value
+            else ROOT_DIR / "Dependencies" / ".fyers_access_token"
+        )
+        if not token_file.is_absolute():
+            token_file = ROOT_DIR / token_file
+        access_token = load_persisted_access_token(
+            token_file,
+            os.getenv("FYERS_ACCESS_TOKEN", ""),
+        )
+        api = FyersAPI(app_id, access_token or "telegram-auth-pending")
+        auth_service = FyersTelegramAuthService(
+            bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            authorized_chat_id=os.getenv("FYERS_AUTH_TELEGRAM_CHAT_ID", ""),
+            client_id=app_id,
+            secret_key=os.getenv("FYERS_SECRET_KEY", ""),
+            redirect_uri=os.getenv("FYERS_REDIRECT_URI", ""),
+            token_file=token_file,
+            market_data_client=api,
+            port=int(os.getenv("PORT", "8787")),
+        )
+        auth_service.start()
+        auth_service.authenticate_startup(has_access_token=bool(access_token))
+        _run_ema_runner(signal_logic, strategy_config, notifier, api)
+    except Exception as exc:
+        _notify_runner_error(notifier, "Unrecoverable runner error", exc, mode)
+        notifier.close(timeout=10.0)
+        raise
+    finally:
+        if auth_service is not None:
+            auth_service.stop()
+
+
+def _run_ema_runner(
+    signal_logic: Any,
+    strategy_config: Any,
+    notifier: TelegramNotifier,
+    api: FyersAPI,
+) -> None:
     underlying_symbol = os.getenv("FYERS_UNDERLYING_SYMBOL", "NSE:NIFTY50-INDEX").strip()
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
     lots = _positive_int("EMA_LOTS", 1)
@@ -148,14 +285,11 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
     max_daily_loss = float(os.getenv("EMA_MAX_LOSS", "5500"))
     if not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
         raise ValueError("EMA_MAX_LOSS must be finite and positive.")
-    if not app_id or not access_token:
-        raise RuntimeError("Set FYERS_APP_ID and FYERS_ACCESS_TOKEN in Dependencies/.env first.")
     if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_WEEK").strip().upper() != "NEXT_WEEK":
         raise RuntimeError("This runner currently supports EMA_OPTION_EXPIRY_POLICY=NEXT_WEEK only.")
     if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
         raise RuntimeError("This runner currently supports EMA_OPTION_STRIKE_POLICY=ATM only.")
 
-    api = FyersAPI(app_id, access_token)
     execution = FyersExecutionClient(api)
     try:
         profile = api.profile()
@@ -169,6 +303,7 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
     signal_engine = signal_logic.EMATrendSignalEngine(strategy_config)
     position: ActivePosition | None = None
     realized_pnl = 0.0
+    completed_trades = 0
     active_date: date | None = None
     last_processed: pd.Timestamp | None = None
     LOGGER.info("EMA runner connected to Fyers; mode=%s; lots=%s", "LIVE" if live_enabled else "PAPER", lots)
@@ -183,7 +318,7 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
         if now.timetz().replace(tzinfo=None) >= day_time(15, 15):
             if position is not None:
                 try:
-                    realized_pnl += _close_position(
+                    closed = _close_position(
                         api,
                         execution,
                         position,
@@ -191,10 +326,24 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
                         product_type=os.getenv("EMA_PRODUCT_TYPE", "INTRADAY"),
                         reason="SQUARE_OFF",
                     )
+                    realized_pnl += closed.pnl
+                    completed_trades += 1
+                    notifier.notify(
+                        _format_exit_alert(position, closed, "SQUARE_OFF", "LIVE" if live_enabled else "PAPER")
+                    )
                 except (FyersAPIError, RuntimeError) as exc:
                     LOGGER.critical("Scheduled EMA exit unresolved: %s", exc)
                     raise
             LOGGER.info("EMA session ended at the configured square-off time.")
+            notifier.notify(
+                _format_eod_alert(
+                    realized_pnl,
+                    completed_trades,
+                    "LIVE" if live_enabled else "PAPER",
+                    datetime.now(IST),
+                )
+            )
+            notifier.close()
             return
         try:
             minute_bars = api.history(
@@ -205,6 +354,12 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
             )
         except FyersAPIError as exc:
             LOGGER.error("Fyers market-data refresh failed; retrying: %s", exc)
+            _notify_runner_error(
+                notifier,
+                "Fyers market-data refresh failed; retrying",
+                exc,
+                "LIVE" if live_enabled else "PAPER",
+            )
             time.sleep(poll_seconds)
             continue
 
@@ -250,36 +405,49 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
                 )
             except FyersAPIError as exc:
                 LOGGER.warning("Unable to refresh the open option mark: %s", exc)
+                _notify_runner_error(
+                    notifier,
+                    "Unable to refresh the open option mark",
+                    exc,
+                    "LIVE" if live_enabled else "PAPER",
+                )
 
         if position is not None and (square_off_due or risk_exit_due or decision.action == "EXIT"):
+            exit_reason = (
+                "SQUARE_OFF"
+                if square_off_due
+                else "DAILY_MAX_LOSS"
+                if risk_exit_due
+                else decision.exit_reason
+            )
+            notifier.notify(
+                f"Fyers EMA EXIT signal | mode={'LIVE' if live_enabled else 'PAPER'}\n"
+                f"Symbol: {position.contract.symbol}\n"
+                f"Reason: {exit_reason}\n"
+                f"Underlying: {float(current['close']):.2f}\n"
+                f"This is a signal, not order/fill confirmation."
+            )
             try:
-                exit_price = mark_price or api.quote_ltp(position.contract.symbol)
-                if live_enabled:
-                    result = execution.place_market_order(
-                        position.contract.symbol,
-                        "SELL",
-                        position.quantity,
-                        product_type=os.getenv("EMA_PRODUCT_TYPE", "INTRADAY"),
-                        order_tag="EMA-EXIT",
-                    )
-                    if result.status is not OrderStatus.FILLED:
-                        raise RuntimeError(
-                            "Fyers exit was not fully confirmed; stop and reconcile the account."
-                        )
-                    if result.average_fill_price > 0:
-                        exit_price = result.average_fill_price
-                trade_pnl = (exit_price - position.entry_option_price) * position.quantity
-                realized_pnl += trade_pnl
+                closed = _close_position(
+                    api,
+                    execution,
+                    position,
+                    live_enabled=live_enabled,
+                    product_type=os.getenv("EMA_PRODUCT_TYPE", "INTRADAY"),
+                    reason=exit_reason,
+                    mark_price=mark_price,
+                )
+                realized_pnl += closed.pnl
+                completed_trades += 1
                 LOGGER.info(
                     "EMA exit confirmed | symbol=%s | reason=%s | pnl=%.2f | daily=%.2f",
                     position.contract.symbol,
-                    "SQUARE_OFF"
-                    if square_off_due
-                    else "DAILY_MAX_LOSS"
-                    if risk_exit_due
-                    else decision.exit_reason,
-                    trade_pnl,
+                    exit_reason,
+                    closed.pnl,
                     realized_pnl,
+                )
+                notifier.notify(
+                    _format_exit_alert(position, closed, exit_reason, "LIVE" if live_enabled else "PAPER")
                 )
                 position = None
             except (FyersAPIError, RuntimeError) as exc:
@@ -296,6 +464,7 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
                 )
                 quantity = contract.lot_size * lots
                 entry_price = api.quote_ltp(contract.symbol)
+                entry_placed_at = datetime.now(IST)
                 if live_enabled:
                     result = execution.place_market_order(
                         contract.symbol,
@@ -306,6 +475,8 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
                     )
                     if result.status is OrderStatus.REJECTED:
                         LOGGER.warning("Fyers rejected EMA entry; no position opened.")
+                        rejection = RuntimeError(result.reason or "Fyers rejected the EMA entry order.")
+                        _notify_runner_error(notifier, "Fyers rejected EMA entry", rejection, "LIVE")
                     elif result.status is not OrderStatus.FILLED:
                         LOGGER.critical("EMA entry outcome is ambiguous; halt and reconcile manually.")
                         raise RuntimeError("Fyers entry was not fully confirmed.")
@@ -323,6 +494,10 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
                         float(current["close"]),
                         float(decision.stop_underlying),
                         entry_price,
+                        entry_placed_at,
+                    )
+                    notifier.notify(
+                        _format_entry_alert(position, lots, "LIVE" if live_enabled else "PAPER")
                     )
                     LOGGER.info(
                         "%s EMA entry | action=%s | symbol=%s | expiry=%s | strike=%s | qty=%s | ltp=%.2f",

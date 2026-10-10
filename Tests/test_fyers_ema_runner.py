@@ -1,13 +1,22 @@
 from datetime import date, datetime
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
+from Dependencies import fyers_ema_runner as ema_runner
 from Dependencies.broker_contract import normalize_order_result
 from Dependencies.fyers_ema_runner import (
     ActivePosition,
+    ClosedPosition,
     _close_position,
     _entry_bar_is_fresh,
+    _format_entry_alert,
+    _format_eod_alert,
+    _format_error_alert,
+    _format_exit_alert,
+    _format_pnl,
     completed_five_minute_bars,
     daily_loss_limit_reached,
 )
@@ -94,9 +103,10 @@ def test_live_square_off_submits_before_needing_a_quote():
         entry_underlying=24000,
         stop_underlying=23950,
         entry_option_price=100,
+        placed_at=datetime(2026, 10, 9, 15, 14, 59, tzinfo=IST),
     )
 
-    pnl = _close_position(
+    closed = _close_position(
         FakeAPI(),
         FakeExecution(),
         position,
@@ -105,4 +115,91 @@ def test_live_square_off_submits_before_needing_a_quote():
         reason="SQUARE_OFF",
     )
 
-    assert pnl == -650
+    assert closed.pnl == -650
+    assert closed.exit_option_price == 90
+    assert closed.placed_at.tzinfo == IST
+
+
+def test_telegram_trade_alerts_match_requested_layout_and_show_placement_time():
+    position = ActivePosition(
+        direction="SHORT",
+        contract=FyersOptionContract(
+            "NSE:NIFTY26O1323350PE", date(2026, 10, 13), "PE", 23350, 65
+        ),
+        quantity=65,
+        entry_underlying=23400,
+        stop_underlying=23450,
+        entry_option_price=759.0,
+        placed_at=datetime(2026, 10, 10, 9, 19, 6, tzinfo=IST),
+    )
+    closed = ClosedPosition(
+        exit_option_price=759.0,
+        pnl=0.0,
+        placed_at=datetime(2026, 10, 10, 9, 45, 0, tzinfo=IST),
+    )
+
+    entry = _format_entry_alert(position, lots=1, mode="PAPER")
+    exit_alert = _format_exit_alert(position, closed, "SQUARE_OFF", "PAPER")
+    eod = _format_eod_alert(0.0, 1, "PAPER", datetime(2026, 10, 10, 9, 45, 1, tzinfo=IST))
+
+    assert "Direction: SHORT" in entry
+    assert "Instrument: BUY NIFTY-Oct2026-23350-PE" in entry
+    assert "Entry: ₹759.00" in entry
+    assert "Qty: 65 (1 lot(s) x 65)" in entry
+    assert "[PAPER] 2026-10-10 09:19:06 IST" in entry
+    assert "EXIT · EMA (TIME_CUTOFF)" in exit_alert
+    assert "Entry: ₹759.00 → Exit: ₹759.00" in exit_alert
+    assert "Instrument: SELL NIFTY-Oct2026-23350-PE" in exit_alert
+    assert "P&L: +₹0.00" in exit_alert
+    assert "[PAPER] 2026-10-10 09:45:00 IST" in exit_alert
+    assert "EMA [PAPER]: +₹0.00 (1 trade(s))" in eod
+    assert "Total: +₹0.00 (1 trade(s))" in eod
+    assert _format_pnl(-12.5) == "-₹12.50"
+
+
+def test_error_alert_includes_traceback_and_redacts_access_token(monkeypatch):
+    secret = "fyers-access-secret-123"
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", secret)
+    try:
+        raise RuntimeError(f"request failed with access_token={secret}")
+    except RuntimeError as error:
+        alert = _format_error_alert("Market-data failure", error, "LIVE")
+
+    assert "🚨 ERROR · EMA" in alert
+    assert "RuntimeError" in alert
+    assert "Traceback (most recent call last)" in alert
+    assert secret not in alert
+    assert "<redacted>" in alert
+    assert len(alert) < 4096
+
+
+def test_runner_reports_fatal_error_to_telegram_then_reraises(monkeypatch):
+    notifier = Mock()
+    auth_service = Mock()
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("FYERS_APP_ID", "test-app-id")
+    monkeypatch.setenv("FYERS_SECRET_KEY", "test-app-secret")
+    monkeypatch.setenv("FYERS_REDIRECT_URI", "https://service.example/callback/")
+    monkeypatch.setenv("FYERS_AUTH_TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-bot-token")
+    monkeypatch.setattr(ema_runner, "load_dotenv", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ema_runner.TelegramNotifier, "from_environment", lambda: notifier)
+    monkeypatch.setattr(ema_runner, "load_persisted_access_token", lambda *_args: "valid-test-token")
+    monkeypatch.setattr(ema_runner, "FyersAPI", lambda *_args: object())
+    monkeypatch.setattr(ema_runner, "FyersTelegramAuthService", lambda **_kwargs: auth_service)
+
+    def fail_runner(*_args):
+        raise RuntimeError("runner exploded")
+
+    monkeypatch.setattr(ema_runner, "_run_ema_runner", fail_runner)
+
+    with pytest.raises(RuntimeError, match="runner exploded"):
+        ema_runner.run_ema_runner(None, None)
+
+    alert = notifier.notify_error.call_args.args[1]
+    assert "Unrecoverable runner error" in alert
+    assert "runner exploded" in alert
+    notifier.close.assert_called_once_with(timeout=10.0)
+    auth_service.start.assert_called_once()
+    auth_service.authenticate_startup.assert_called_once_with(has_access_token=True)
+    auth_service.stop.assert_called_once()

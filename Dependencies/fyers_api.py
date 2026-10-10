@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import math
+import os
 import time as sleep_time
+from collections.abc import Callable
 from datetime import date, datetime, time
 from io import StringIO
 from typing import Any
@@ -153,6 +155,23 @@ class FyersAPI:
         }
         self._option_master_cache: list[dict[str, Any]] | None = None
         self._last_get_started = 0.0
+
+    def replace_access_token(self, token: str, *, persist: Callable[[str], None]) -> None:
+        refreshed_token = str(token).strip()
+        if not refreshed_token:
+            raise ValueError("A Fyers access token must not be empty.")
+        persist(refreshed_token)
+        self.access_token = refreshed_token
+        self._headers = {
+            **self._headers,
+            "Authorization": f"{self.app_id}:{refreshed_token}",
+        }
+        os.environ["FYERS_ACCESS_TOKEN"] = refreshed_token
+
+    def validate_session(self) -> None:
+        profile = self.profile()
+        if profile.get("s") != "ok":
+            raise RuntimeError("Fyers rejected the access token.")
 
     def _request(
         self,

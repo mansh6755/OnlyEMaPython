@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime
 
 import pytest
@@ -148,6 +149,28 @@ def test_fyers_get_retries_rate_limit_once(monkeypatch):
 
     assert response["s"] == "ok"
     assert session.calls == 2
+
+
+def test_replace_access_token_persists_and_updates_future_request_headers(monkeypatch):
+    session = _Session(_Response({"s": "ok", "candles": []}))
+    api = FyersAPI("app-100", "old-token", session=session)
+    persisted = []
+    monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)
+
+    api.replace_access_token("new-token", persist=persisted.append)
+    api._request("GET", "https://example.test", "/profile")
+
+    assert persisted == ["new-token"]
+    assert api.access_token == "new-token"
+    assert session.last_request[1]["headers"]["Authorization"] == "app-100:new-token"
+    assert os.environ["FYERS_ACCESS_TOKEN"] == "new-token"
+
+
+def test_validate_session_raises_when_fyers_rejects_session():
+    api = FyersAPI("app-100", "test-token", session=_Session(_Response({"s": "no"})))
+
+    with pytest.raises(RuntimeError, match="rejected the access token"):
+        api.validate_session()
 
 
 def test_expired_history_uses_fno_expired_endpoint():
