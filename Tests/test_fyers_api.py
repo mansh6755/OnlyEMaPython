@@ -6,10 +6,10 @@ from Dependencies.fyers_api import FyersAPI, FyersAPIError, build_auth_url, pars
 
 
 class _Response:
-    status_code = 200
-
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200, headers=None):
         self.payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def json(self):
         return self.payload
@@ -106,3 +106,99 @@ def test_option_chain_uses_the_fyers_data_api_base():
 
     assert session.last_request[0][1] == "https://api-t1.fyers.in/data/options-chain-v3"
     assert session.last_request[1]["headers"]["version"] == "3"
+
+
+def test_history_uses_epoch_ranges_for_five_second_candles():
+    session = _Session(_Response({"s": "ok", "candles": []}))
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    api.history(
+        "NSE:NIFTY50-INDEX",
+        resolution="5S",
+        start=datetime(2026, 10, 1).date(),
+        end=datetime(2026, 10, 9).date(),
+    )
+
+    args, kwargs = session.last_request
+    assert args[1] == "https://api-t1.fyers.in/data/history"
+    assert kwargs["params"]["resolution"] == "5S"
+    assert kwargs["params"]["date_format"] == "0"
+    assert kwargs["params"]["range_from"].isdigit()
+    assert kwargs["params"]["range_to"].isdigit()
+
+
+def test_fyers_get_retries_rate_limit_once(monkeypatch):
+    class QueueSession:
+        def __init__(self):
+            self.responses = [
+                _Response({}, status_code=429, headers={"Retry-After": "0"}),
+                _Response({"s": "ok", "candles": []}),
+            ]
+            self.calls = 0
+
+        def request(self, *args, **kwargs):
+            self.calls += 1
+            return self.responses.pop(0)
+
+    session = QueueSession()
+    monkeypatch.setattr("Dependencies.fyers_api.sleep_time.sleep", lambda _delay: None)
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    response = api._request("GET", "https://example.test", "/history")
+
+    assert response["s"] == "ok"
+    assert session.calls == 2
+
+
+def test_expired_history_uses_fno_expired_endpoint():
+    session = _Session(_Response({"s": "ok", "candles": []}))
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    api.history(
+        "NSE:NIFTY26O0622500CE",
+        resolution="5S",
+        start=datetime(2026, 10, 1).date(),
+        end=datetime(2026, 10, 6).date(),
+        expired=True,
+    )
+
+    args, kwargs = session.last_request
+    assert args[1] == "https://api-t1.fyers.in/data/history/fno/expired/historical-data"
+    assert kwargs["params"]["include_greeks"] == "0"
+
+
+def test_expired_history_accepts_fyers_no_data_response_as_empty():
+    session = _Session(_Response({"s": "no_data", "candles": []}))
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    candles = api.history(
+        "NSE:NIFTY2650517100CE",
+        resolution="1",
+        start=datetime(2026, 5, 5).date(),
+        end=datetime(2026, 5, 5).date(),
+        expired=True,
+    )
+
+    assert candles.empty
+    assert list(candles.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_expired_option_expiries_and_symbols_unwrap_data_payload():
+    class QueueSession:
+        def __init__(self):
+            self.responses = [
+                _Response({"s": "ok", "data": {"expiry_dates": {"options": ["2026-10-06"]}}}),
+                _Response({"s": "ok", "data": {"contracts": {"options": ["NSE:NIFTY26O0622500CE"]}}}),
+            ]
+
+        def request(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    api = FyersAPI("app-100", "test-token", session=QueueSession())
+
+    assert api.expired_option_expiries(
+        "NSE:NIFTY50-INDEX", datetime(2026, 10, 1).date(), datetime(2026, 10, 9).date()
+    ) == [datetime(2026, 10, 6).date()]
+    assert api.expired_option_symbols(
+        "NSE:NIFTY50-INDEX", datetime(2026, 10, 6).date()
+    ) == ["NSE:NIFTY26O0622500CE"]

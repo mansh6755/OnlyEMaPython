@@ -5,7 +5,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import math
-from datetime import date
+import time as sleep_time
+from datetime import date, datetime, time
 from io import StringIO
 from typing import Any
 from urllib.parse import urlencode
@@ -54,6 +55,23 @@ def build_auth_url(app_id: str, redirect_uri: str, state: str) -> str:
         "state": state,
     }
     return f"{API_BASE}/generate-authcode?{urlencode(params)}"
+
+
+def _history_epoch(value: date | datetime, *, end_of_day: bool) -> int:
+    if isinstance(value, datetime):
+        timestamp = pd.Timestamp(value)
+        timestamp = (
+            timestamp.tz_localize(IST) if timestamp.tzinfo is None else timestamp.tz_convert(IST)
+        )
+    else:
+        boundary_time = time(23, 59, 59) if end_of_day else time(0, 0)
+        timestamp = pd.Timestamp(datetime.combine(value, boundary_time), tz=IST)
+    return int(timestamp.timestamp())
+
+
+def _unwrap_data(response: dict[str, Any]) -> dict[str, Any]:
+    data = response.get("data")
+    return data if isinstance(data, dict) else response
 
 
 def parse_nse_fo_master(content: str) -> list[dict[str, Any]]:
@@ -134,6 +152,7 @@ class FyersAPI:
             "version": "3",
         }
         self._option_master_cache: list[dict[str, Any]] | None = None
+        self._last_get_started = 0.0
 
     def _request(
         self,
@@ -144,20 +163,39 @@ class FyersAPI:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        try:
-            response = self.session.request(
-                method,
-                f"{base_url}{path}",
-                headers=self._headers,
-                params=params,
-                json=payload,
-                timeout=self.timeout,
-            )
-            result = response.json()
-        except (requests.RequestException, ValueError) as exc:
-            raise FyersAPIError(f"Fyers {path} request failed.") from exc
+        response = None
+        for attempt in range(6):
+            if method.upper() == "GET":
+                wait_seconds = 0.5 - (sleep_time.monotonic() - self._last_get_started)
+                if wait_seconds > 0:
+                    sleep_time.sleep(wait_seconds)
+                self._last_get_started = sleep_time.monotonic()
+            try:
+                response = self.session.request(
+                    method,
+                    f"{base_url}{path}",
+                    headers=self._headers,
+                    params=params,
+                    json=payload,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                raise FyersAPIError(f"Fyers {path} request failed.") from exc
+            if response.status_code != 429 or method.upper() != "GET" or attempt == 5:
+                break
+            try:
+                retry_after = float(response.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            sleep_time.sleep(min(max(retry_after, 2.0**attempt), 60.0))
+        if response is None:
+            raise FyersAPIError(f"Fyers {path} request failed without a response.")
         if response.status_code >= 400:
             raise FyersAPIError(f"Fyers {path} returned HTTP {response.status_code}.")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise FyersAPIError(f"Fyers {path} returned invalid JSON.") from exc
         if not isinstance(result, dict):
             raise FyersAPIError(f"Fyers {path} returned a non-object response.")
         if result.get("s") == "error":
@@ -172,23 +210,32 @@ class FyersAPI:
         symbol: str,
         *,
         resolution: str,
-        start: date,
-        end: date,
+        start: date | datetime,
+        end: date | datetime,
+        expired: bool = False,
     ) -> pd.DataFrame:
+        if _history_epoch(start, end_of_day=False) > _history_epoch(end, end_of_day=True):
+            raise ValueError("history start must not be after end")
+        endpoint = "/history/fno/expired/historical-data" if expired else "/history"
+        params = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "0",
+            "range_from": str(_history_epoch(start, end_of_day=False)),
+            "range_to": str(_history_epoch(end, end_of_day=True)),
+            "cont_flag": "1",
+        }
+        if expired:
+            params.update({"include_oi": "0", "include_greeks": "0"})
         response = self._request(
             "GET",
             DATA_BASE,
-            "/history",
-            params={
-                "symbol": symbol,
-                "resolution": resolution,
-                "date_format": "1",
-                "range_from": start.isoformat(),
-                "range_to": end.isoformat(),
-                "cont_flag": "0",
-            },
+            endpoint,
+            params=params,
         )
-        candles = response.get("candles")
+        candles = _unwrap_data(response).get("candles")
+        if response.get("s") == "no_data":
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
         if response.get("s") != "ok" or not isinstance(candles, list):
             raise FyersAPIError("Fyers history response did not contain candle data.")
         rows: list[dict[str, Any]] = []
@@ -212,6 +259,41 @@ class FyersAPI:
                 }
             )
         return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    def expired_option_expiries(self, underlying_symbol: str, start: date, end: date) -> list[date]:
+        response = self._request(
+            "GET",
+            DATA_BASE,
+            "/history/fno/expired/expiry-dates",
+            params={
+                "symbol": underlying_symbol,
+                "date_format": "1",
+                "range_from": start.isoformat(),
+                "range_to": end.isoformat(),
+            },
+        )
+        expiry_dates = _unwrap_data(response).get("expiry_dates", {})
+        if not isinstance(expiry_dates, dict):
+            raise FyersAPIError("Fyers expired-expiry response was malformed.")
+        options = expiry_dates.get("options", [])
+        if not isinstance(options, list):
+            raise FyersAPIError("Fyers expired option expiry list was malformed.")
+        return [date.fromisoformat(str(item)[:10]) for item in options]
+
+    def expired_option_symbols(self, underlying_symbol: str, expiry: date) -> list[str]:
+        response = self._request(
+            "GET",
+            DATA_BASE,
+            "/history/fno/expired/underlying-symbols",
+            params={"symbol": underlying_symbol, "expiry_date": expiry.isoformat()},
+        )
+        contracts = _unwrap_data(response).get("contracts", {})
+        if not isinstance(contracts, dict):
+            raise FyersAPIError("Fyers expired option symbol response was malformed.")
+        options = contracts.get("options", [])
+        if not isinstance(options, list):
+            raise FyersAPIError("Fyers expired option symbols were malformed.")
+        return [str(symbol).strip() for symbol in options if str(symbol).strip()]
 
     def quotes(self, symbols: list[str]) -> dict[str, Any]:
         if not symbols:
