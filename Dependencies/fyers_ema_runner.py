@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from Dependencies.broker_contract import OrderStatus
 from Dependencies.fyers_api import FyersAPI, FyersAPIError
+from Dependencies.fyers_dashboard_state import FyersDashboardState
 from Dependencies.fyers_execution import FyersExecutionClient
 from Dependencies.fyers_options import FyersOptionContract
 from Dependencies.fyers_telegram_auth import (
@@ -59,6 +60,73 @@ def _format_pnl(value: float) -> str:
 
 def _display_instrument(contract: FyersOptionContract) -> str:
     return f"NIFTY-{contract.expiry:%b%Y}-{contract.strike:g}-{contract.option_type}"
+
+
+def _dashboard_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _dashboard_candles(strategy_frame: pd.DataFrame, *, limit: int = 240) -> list[dict[str, Any]]:
+    candles: list[dict[str, Any]] = []
+    for _, row in strategy_frame.tail(limit).iterrows():
+        timestamp = pd.Timestamp(row["timestamp"])
+        timestamp = timestamp.tz_localize(IST) if timestamp.tzinfo is None else timestamp.tz_convert(IST)
+        candle = {
+            "time": int(timestamp.timestamp()),
+            "open": _dashboard_number(row.get("open")),
+            "high": _dashboard_number(row.get("high")),
+            "low": _dashboard_number(row.get("low")),
+            "close": _dashboard_number(row.get("close")),
+            "ema_fast": _dashboard_number(row.get("ema4")),
+            "ema_mid": _dashboard_number(row.get("ema11")),
+            "ema_slow": _dashboard_number(row.get("ema18")),
+        }
+        if all(candle[key] is not None for key in ("open", "high", "low", "close")):
+            candles.append(candle)
+    return candles
+
+
+def _dashboard_position(position: ActivePosition | None, mark_price: float | None) -> dict[str, Any] | None:
+    if position is None:
+        return None
+    mark = mark_price if mark_price is not None else position.entry_option_price
+    return {
+        "direction": position.direction,
+        "symbol": position.contract.symbol,
+        "display_symbol": _display_instrument(position.contract),
+        "quantity": position.quantity,
+        "entry_price": position.entry_option_price,
+        "mark_price": mark,
+        "open_pnl": (mark - position.entry_option_price) * position.quantity,
+        "entry_spot": position.entry_underlying,
+        "stop_spot": position.stop_underlying,
+        "opened_at": position.placed_at.isoformat(),
+    }
+
+
+def _dashboard_closed_trade(
+    position: ActivePosition,
+    closed: ClosedPosition,
+    reason: str,
+    mode: str,
+) -> dict[str, Any]:
+    return {
+        "time": position.placed_at.isoformat(),
+        "exit_time": closed.placed_at.isoformat(),
+        "direction": position.direction,
+        "symbol": position.contract.symbol,
+        "display_symbol": _display_instrument(position.contract),
+        "quantity": position.quantity,
+        "entry_price": position.entry_option_price,
+        "exit_price": closed.exit_option_price,
+        "pnl": closed.pnl,
+        "reason": reason,
+        "mode": mode,
+    }
 
 
 def _format_entry_alert(position: ActivePosition, lots: int, mode: str) -> str:
@@ -291,6 +359,8 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
     notifier = TelegramNotifier.from_environment()
     mode = "LIVE" if os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true" else "PAPER"
     auth_service: FyersTelegramAuthService | None = None
+    dashboard_state = FyersDashboardState()
+    dashboard_enabled = os.getenv("DASHBOARD_ENABLED", "true").strip().lower() == "true"
     try:
         app_id = os.getenv("FYERS_APP_ID", "").strip()
         token_file_value = os.getenv("FYERS_TOKEN_FILE", "").strip()
@@ -315,10 +385,15 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
             token_file=token_file,
             market_data_client=api,
             port=int(os.getenv("PORT", "8787")),
+            dashboard_state=dashboard_state,
+            dashboard_enabled=dashboard_enabled,
         )
         auth_service.start()
         auth_service.authenticate_startup(has_access_token=bool(access_token))
-        _run_ema_runner(signal_logic, strategy_config, notifier, api)
+        dashboard_state.record_event(
+            {"at": datetime.now(IST).isoformat(), "level": "SUCCESS", "message": "Fyers session authenticated"}
+        )
+        _run_ema_runner(signal_logic, strategy_config, notifier, api, dashboard_state)
     except Exception as exc:
         _notify_runner_error(notifier, "Unrecoverable runner error", exc, mode)
         notifier.close(timeout=10.0)
@@ -333,6 +408,7 @@ def _run_ema_runner(
     strategy_config: Any,
     notifier: TelegramNotifier,
     api: FyersAPI,
+    dashboard_state: FyersDashboardState,
 ) -> None:
     underlying_symbol = os.getenv("FYERS_UNDERLYING_SYMBOL", "NSE:NIFTY50-INDEX").strip()
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
@@ -367,6 +443,27 @@ def _run_ema_runner(
     market_data_status = "WAITING FOR FIRST FETCH"
     last_market_data_at: datetime | None = None
     day_started_notified_date: date | None = None
+    last_mark_price: float | None = None
+    mode = "LIVE" if live_enabled else "PAPER"
+    dashboard_state.update_service(
+        status="RUNNING",
+        mode=mode,
+        strategy="EMA",
+        underlying=underlying_symbol,
+        started_at=startup_at.isoformat(),
+        trading_day=startup_at.date().isoformat(),
+    )
+    dashboard_state.update_market(status=market_data_status, underlying=underlying_symbol)
+    dashboard_state.update_account(
+        realized_pnl=0.0,
+        open_pnl=0.0,
+        total_pnl=0.0,
+        trade_count=0,
+        daily_loss_limit=max_daily_loss,
+    )
+    dashboard_state.record_event(
+        {"at": startup_at.isoformat(), "level": "SUCCESS", "message": "EMA strategy started successfully"}
+    )
     notifier.notify(
         _format_strategy_started_alert(
             "LIVE" if live_enabled else "PAPER",
@@ -380,6 +477,12 @@ def _run_ema_runner(
 
     while True:
         now = datetime.now(IST)
+        dashboard_state.update_service(
+            status="RUNNING",
+            mode=mode,
+            trading_day=now.date().isoformat(),
+            last_loop_at=now.isoformat(),
+        )
         if now >= next_health_at:
             notifier.notify(
                 _format_health_alert(
@@ -395,7 +498,17 @@ def _run_ema_runner(
         if active_date != now.date():
             active_date = now.date()
             realized_pnl = 0.0
+            completed_trades = 0
             last_processed = None
+            day_started_notified_date = None
+            last_mark_price = None
+            dashboard_state.update_account(
+                realized_pnl=0.0,
+                open_pnl=0.0,
+                total_pnl=0.0,
+                trade_count=0,
+                daily_loss_limit=max_daily_loss,
+            )
         if now.timetz().replace(tzinfo=None) >= day_time(15, 15):
             if position is not None:
                 try:
@@ -409,6 +522,17 @@ def _run_ema_runner(
                     )
                     realized_pnl += closed.pnl
                     completed_trades += 1
+                    dashboard_state.record_trade(
+                        _dashboard_closed_trade(position, closed, "TIME_CUTOFF", mode)
+                    )
+                    dashboard_state.record_event(
+                        {
+                            "at": closed.placed_at.isoformat(),
+                            "level": "TRADE",
+                            "message": "Position closed at session cutoff",
+                        }
+                    )
+                    dashboard_state.set_position(None)
                     notifier.notify(
                         _format_exit_alert(position, closed, "SQUARE_OFF", "LIVE" if live_enabled else "PAPER")
                     )
@@ -416,6 +540,17 @@ def _run_ema_runner(
                     LOGGER.critical("Scheduled EMA exit unresolved: %s", exc)
                     raise
             LOGGER.info("EMA session ended at the configured square-off time.")
+            dashboard_state.update_service(status="SESSION CLOSED", stopped_at=datetime.now(IST).isoformat())
+            dashboard_state.update_account(
+                realized_pnl=realized_pnl,
+                open_pnl=0.0,
+                total_pnl=realized_pnl,
+                trade_count=completed_trades,
+                daily_loss_limit=max_daily_loss,
+            )
+            dashboard_state.record_event(
+                {"at": datetime.now(IST).isoformat(), "level": "INFO", "message": "EMA session ended at cutoff"}
+            )
             notifier.notify(
                 _format_eod_alert(
                     realized_pnl,
@@ -437,6 +572,10 @@ def _run_ema_runner(
             market_data_status = "OK"
         except FyersAPIError as exc:
             market_data_status = "RETRYING"
+            dashboard_state.update_market(status=market_data_status, last_error=type(exc).__name__)
+            dashboard_state.record_event(
+                {"at": now.isoformat(), "level": "ERROR", "message": "Fyers market-data refresh failed; retrying"}
+            )
             LOGGER.error("Fyers market-data refresh failed; retrying: %s", exc)
             _notify_runner_error(
                 notifier,
@@ -446,6 +585,12 @@ def _run_ema_runner(
             )
             time.sleep(poll_seconds)
             continue
+        dashboard_state.update_market(
+            status="OK",
+            underlying=underlying_symbol,
+            last_success_at=last_market_data_at.isoformat(),
+            last_error=None,
+        )
 
         bars = completed_five_minute_bars(minute_bars, now)
         if bars.empty:
@@ -475,6 +620,29 @@ def _run_ema_runner(
             if current_timestamp != last_processed
             else signal_logic.EMATrendDecision()
         )
+        dashboard_state.update_market(
+            status=market_data_status,
+            underlying=underlying_symbol,
+            last_success_at=last_market_data_at.isoformat() if last_market_data_at else None,
+            bar_at=current_timestamp.isoformat(),
+            spot=_dashboard_number(current.get("close")),
+            ema_fast=_dashboard_number(current.get("ema4")),
+            ema_mid=_dashboard_number(current.get("ema11")),
+            ema_slow=_dashboard_number(current.get("ema18")),
+            atr=_dashboard_number(current.get("atr")),
+            adx=_dashboard_number(current.get("adx")),
+            candles=_dashboard_candles(strategy_frame),
+        )
+        dashboard_state.update_signal(
+            action=decision.action,
+            status="SETUP" if decision.action != "HOLD" else "SCANNING",
+            at=now.isoformat(),
+            stop_spot=_dashboard_number(decision.stop_underlying),
+        )
+        if decision.action != "HOLD":
+            dashboard_state.record_event(
+                {"at": now.isoformat(), "level": "SIGNAL", "message": f"EMA {decision.action} signal"}
+            )
         if current_timestamp.date() == now.date() and day_started_notified_date != now.date():
             notifier.notify(
                 _format_day_started_alert(
@@ -486,11 +654,19 @@ def _run_ema_runner(
                 )
             )
             day_started_notified_date = now.date()
+            dashboard_state.record_event(
+                {
+                    "at": last_market_data_at.isoformat() if last_market_data_at else now.isoformat(),
+                    "level": "SUCCESS",
+                    "message": f"Session data ready: {len(minute_bars)} one-minute bars fetched",
+                }
+            )
         mark_price: float | None = None
         risk_exit_due = False
         if position is not None:
             try:
                 mark_price = api.quote_ltp(position.contract.symbol)
+                last_mark_price = mark_price
                 risk_exit_due = daily_loss_limit_reached(
                     realized_pnl,
                     position.entry_option_price,
@@ -500,6 +676,9 @@ def _run_ema_runner(
                 )
             except FyersAPIError as exc:
                 LOGGER.warning("Unable to refresh the open option mark: %s", exc)
+                dashboard_state.record_event(
+                    {"at": now.isoformat(), "level": "WARN", "message": "Unable to refresh active option mark"}
+                )
                 _notify_runner_error(
                     notifier,
                     "Unable to refresh the open option mark",
@@ -534,6 +713,17 @@ def _run_ema_runner(
                 )
                 realized_pnl += closed.pnl
                 completed_trades += 1
+                dashboard_state.record_trade(
+                    _dashboard_closed_trade(position, closed, exit_reason, mode)
+                )
+                dashboard_state.record_event(
+                    {
+                        "at": closed.placed_at.isoformat(),
+                        "level": "TRADE",
+                        "message": f"EMA position closed: {exit_reason}",
+                    }
+                )
+                last_mark_price = None
                 LOGGER.info(
                     "EMA exit confirmed | symbol=%s | reason=%s | pnl=%.2f | daily=%.2f",
                     position.contract.symbol,
@@ -572,6 +762,13 @@ def _run_ema_runner(
                         LOGGER.warning("Fyers rejected EMA entry; no position opened.")
                         rejection = RuntimeError(result.reason or "Fyers rejected the EMA entry order.")
                         _notify_runner_error(notifier, "Fyers rejected EMA entry", rejection, "LIVE")
+                        dashboard_state.record_event(
+                            {
+                                "at": datetime.now(IST).isoformat(),
+                                "level": "ERROR",
+                                "message": "Fyers rejected EMA entry",
+                            }
+                        )
                     elif result.status is not OrderStatus.FILLED:
                         LOGGER.critical("EMA entry outcome is ambiguous; halt and reconcile manually.")
                         raise RuntimeError("Fyers entry was not fully confirmed.")
@@ -591,6 +788,15 @@ def _run_ema_runner(
                         entry_price,
                         entry_placed_at,
                     )
+                    last_mark_price = entry_price
+                    dashboard_state.set_position(_dashboard_position(position, last_mark_price))
+                    dashboard_state.record_event(
+                        {
+                            "at": entry_placed_at.isoformat(),
+                            "level": "TRADE",
+                            "message": f"EMA {direction} position opened",
+                        }
+                    )
                     notifier.notify(
                         _format_entry_alert(position, lots, "LIVE" if live_enabled else "PAPER")
                     )
@@ -605,6 +811,26 @@ def _run_ema_runner(
                         entry_price,
                     )
 
+        if position is None:
+            dashboard_state.set_position(None)
+            dashboard_state.update_account(
+                realized_pnl=realized_pnl,
+                open_pnl=0.0,
+                total_pnl=realized_pnl,
+                trade_count=completed_trades,
+                daily_loss_limit=max_daily_loss,
+            )
+        else:
+            position_snapshot = _dashboard_position(position, last_mark_price)
+            open_pnl = position_snapshot["open_pnl"] if position_snapshot is not None else None
+            dashboard_state.set_position(position_snapshot)
+            dashboard_state.update_account(
+                realized_pnl=realized_pnl,
+                open_pnl=open_pnl,
+                total_pnl=realized_pnl + float(open_pnl or 0.0),
+                trade_count=completed_trades,
+                daily_loss_limit=max_daily_loss,
+            )
         if current_timestamp != last_processed:
             last_processed = current_timestamp
         time.sleep(poll_seconds)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -10,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 import requests
@@ -21,6 +23,16 @@ TELEGRAM_API = "https://api.telegram.org"
 AUTH_CODE_TTL_SECONDS = 10 * 60
 SESSION_CHECK_INTERVAL_SECONDS = 5 * 60
 HTTP_TIMEOUT_SECONDS = (5.0, 30.0)
+DASHBOARD_ASSETS_DIR = Path(__file__).resolve().parent / "dashboard_assets"
+DASHBOARD_ASSET_ROUTES = {
+    "/": ("fyers_dashboard.html", "text/html; charset=utf-8"),
+    "/dashboard.css": ("fyers_dashboard.css", "text/css; charset=utf-8"),
+    "/dashboard.js": ("fyers_dashboard.js", "text/javascript; charset=utf-8"),
+    "/vendor/lightweight-charts.standalone.production.js": (
+        "vendor/lightweight-charts.standalone.production.js",
+        "text/javascript; charset=utf-8",
+    ),
+}
 
 
 def load_persisted_access_token(token_file: Path, fallback: str = "") -> str:
@@ -74,6 +86,8 @@ class FyersTelegramAuthService:
         token_file: Path,
         market_data_client: FyersAPI,
         port: int,
+        dashboard_state: Any | None = None,
+        dashboard_enabled: bool = False,
     ) -> None:
         parsed_redirect = urlparse(redirect_uri)
         callback_path = parsed_redirect.path.rstrip("/") or "/"
@@ -90,8 +104,11 @@ class FyersTelegramAuthService:
             raise ValueError("FYERS_AUTH_TELEGRAM_CHAT_ID must be a numeric private-chat ID.")
         if not bot_token.strip() or not client_id.strip() or not secret_key.strip():
             raise ValueError("Fyers Telegram authentication credentials are incomplete.")
+
         if not 1 <= port <= 65535:
             raise ValueError("Railway PORT must be between 1 and 65535.")
+        if dashboard_enabled and dashboard_state is None:
+            raise ValueError("Dashboard state is required when the dashboard is enabled.")
 
         self.bot_token = bot_token.strip()
         self.authorized_chat_id = authorized_chat_id.strip()
@@ -102,6 +119,17 @@ class FyersTelegramAuthService:
         self.token_file = token_file
         self.market_data_client = market_data_client
         self.port = port
+        self.dashboard_enabled = dashboard_enabled
+        self.dashboard_state = dashboard_state
+        self._dashboard_assets = (
+            {
+                route: (path.read_bytes(), content_type)
+                for route, (relative_path, content_type) in DASHBOARD_ASSET_ROUTES.items()
+                for path in (DASHBOARD_ASSETS_DIR / relative_path,)
+            }
+            if dashboard_enabled
+            else {}
+        )
         self._stop_event = threading.Event()
         self._token_updated = threading.Event()
         self._state_lock = threading.Lock()
@@ -138,8 +166,44 @@ class FyersTelegramAuthService:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _respond_bytes(self, status: int, body: bytes, content_type: str) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'",
+                )
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _dashboard(self, request_path: str) -> bool:
+                if request_path not in DASHBOARD_ASSET_ROUTES and request_path != "/api/dashboard":
+                    return False
+                if not service.dashboard_enabled:
+                    self._respond(404, "Not found.")
+                    return True
+                if request_path == "/api/dashboard":
+                    body = json.dumps(
+                        service.dashboard_state.snapshot(),
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    self._respond_bytes(200, body, "application/json; charset=utf-8")
+                    return True
+                body, content_type = service._dashboard_assets[request_path]
+                self._respond_bytes(200, body, content_type)
+                return True
+
             def do_GET(self) -> None:
                 request_path = urlsplit(self.path).path.rstrip("/") or "/"
+                if self._dashboard(request_path):
+                    return
                 if request_path == "/":
                     self._respond(200, "Fyers authentication callback is ready.")
                     return

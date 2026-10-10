@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080d13">
+  <title>Nightwatch | EMA Live</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="identity">
+      <div class="sigil" aria-hidden="true">N</div>
+      <div>
+        <div class="wordmark">NIGHTWATCH <span>///</span> TRADING SYSTEMS</div>
+        <div class="submark">NIFTY · EMA TREND ENGINE</div>
+      </div>
+    </div>
+    <div class="top-status">
+      <span id="mode" class="mode-tag">PAPER</span>
+      <span id="service-status" class="service-state"><i></i> CONNECTING</span>
+      <span id="clock" class="clock">--:--:-- IST</span>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <section class="metrics" aria-label="Session metrics">
+      <article class="metric featured">
+        <div class="metric-label">SESSION TOTAL</div>
+        <div id="total-pnl" class="metric-value">--</div>
+        <div class="metric-foot"><span class="live-mark"></span><span id="session-date">Awaiting session</span></div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">REALIZED</div>
+        <div id="realized-pnl" class="metric-value">--</div>
+        <div class="metric-foot"><span id="trade-count">0 trades</span><span>today</span></div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">OPEN P&amp;L</div>
+        <div id="open-pnl" class="metric-value">--</div>
+        <div class="metric-foot" id="position-state">NO OPEN POSITION</div>
+      </article>
+      <article class="metric risk-metric">
+        <div class="metric-label">DAILY LOSS LIMIT</div>
+        <div id="loss-limit" class="metric-value">--</div>
+        <div class="risk-track"><span id="risk-fill"></span></div>
+      </article>
+    </section>
+
+    <section class="primary-grid">
+      <article class="panel chart-panel">
+        <div class="panel-head chart-head">
+          <div>
+            <div class="eyebrow">MARKET STRUCTURE <span class="accent">/</span> 5 MIN</div>
+            <h1>NIFTY <span id="spot-price">--</span></h1>
+          </div>
+          <div class="chart-meta">
+            <span id="bar-time">WAITING FOR BARS</span>
+            <span id="feed-state" class="feed-state">FEED IDLE</span>
+          </div>
+        </div>
+        <div class="chart-legend">
+          <span><i class="legend-fast"></i> EMA 4</span>
+          <span><i class="legend-mid"></i> EMA 11</span>
+          <span><i class="legend-slow"></i> EMA 18</span>
+          <span class="chart-source">FYERS MARKET DATA</span>
+        </div>
+        <div class="chart-wrap">
+          <div id="price-chart" role="img" aria-label="NIFTY five-minute candlestick chart"></div>
+          <div id="chart-empty" class="chart-empty">AWAITING LIVE MARKET DATA</div>
+        </div>
+      </article>
+
+      <aside class="side-stack">
+        <article class="panel position-panel">
+          <div class="panel-head">
+            <div class="eyebrow">EXPOSURE <span class="accent">/</span> LIVE BOOK</div>
+            <span id="position-badge" class="quiet-tag">FLAT</span>
+          </div>
+          <div id="position-empty" class="position-empty">
+            <div class="empty-emblem">—</div>
+            <div>NO ACTIVE POSITION</div>
+          </div>
+          <div id="position-detail" class="position-detail" hidden>
+            <div class="position-direction"><span id="position-direction">--</span><span id="position-qty">--</span></div>
+            <div id="position-symbol" class="position-symbol">--</div>
+            <div class="position-pnl-row"><span>OPEN P&amp;L</span><strong id="position-pnl">--</strong></div>
+            <dl class="position-data">
+              <div><dt>ENTRY PREMIUM</dt><dd id="position-entry">--</dd></div>
+              <div><dt>MARK</dt><dd id="position-mark">--</dd></div>
+              <div><dt>ENTRY SPOT</dt><dd id="position-spot">--</dd></div>
+              <div><dt>EMA STOP</dt><dd id="position-stop">--</dd></div>
+              <div><dt>OPENED</dt><dd id="position-opened">--</dd></div>
+            </dl>
+          </div>
+        </article>
+
+        <article class="panel signal-panel">
+          <div class="panel-head">
+            <div class="eyebrow">SIGNAL ENGINE</div>
+            <span id="signal-status" class="quiet-tag">SCANNING</span>
+          </div>
+          <div id="signal-action" class="signal-action">WAITING</div>
+          <div class="indicator-grid">
+            <div><span>EMA 4</span><strong id="ema-fast">--</strong></div>
+            <div><span>EMA 11</span><strong id="ema-mid">--</strong></div>
+            <div><span>EMA 18</span><strong id="ema-slow">--</strong></div>
+            <div><span>ADX</span><strong id="adx">--</strong></div>
+            <div><span>ATR</span><strong id="atr">--</strong></div>
+            <div><span>DATA AGE</span><strong id="data-age">--</strong></div>
+          </div>
+        </article>
+      </aside>
+    </section>
+
+    <section class="lower-grid">
+      <article class="panel table-panel">
+        <div class="panel-head">
+          <div class="eyebrow">TRADE TAPE <span class="accent">/</span> CLOSED TODAY</div>
+          <span id="closed-count" class="quiet-tag">0 FILLS</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>TIME</th><th>DIR</th><th>CONTRACT</th><th class="num">QTY</th><th class="num">ENTRY</th><th class="num">EXIT</th><th class="num">P&amp;L</th><th>REASON</th></tr></thead>
+            <tbody id="trade-rows"></tbody>
+          </table>
+          <div id="trades-empty" class="table-empty">NO CLOSED TRADES</div>
+        </div>
+      </article>
+      <article class="panel events-panel">
+        <div class="panel-head">
+          <div class="eyebrow">SYSTEM ACTIVITY</div>
+          <span id="updated-at" class="quiet-tag">SYNC --</span>
+        </div>
+        <ol id="event-list" class="event-list"></ol>
+        <div id="events-empty" class="table-empty">NO EVENTS REPORTED</div>
+      </article>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>NIGHTWATCH <b>EMA-01</b></span>
+    <span>READ ONLY <i></i> BROKER REMAINS AUTHORITATIVE</span>
+    <span>LIGHTWEIGHT CHARTS · APACHE-2.0</span>
+  </footer>
+
+  <script src="/vendor/lightweight-charts.standalone.production.js"></script>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

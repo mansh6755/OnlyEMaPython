@@ -1,4 +1,7 @@
+import http.client
+import json
 import socket
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -170,3 +173,48 @@ def test_auth_service_requires_https_and_numeric_private_chat(tmp_path):
         auth.FyersTelegramAuthService(**(common | {"redirect_uri": "http://service.example/callback"}))
     with pytest.raises(ValueError, match="numeric private-chat"):
         auth.FyersTelegramAuthService(**(common | {"authorized_chat_id": "@channel"}))
+
+
+def test_dashboard_is_public_read_only_when_enabled(tmp_path):
+    class _DashboardState:
+        def snapshot(self):
+            return {"service": {"status": "RUNNING"}, "position": None}
+
+    service = auth.FyersTelegramAuthService(
+        bot_token="bot-token",
+        authorized_chat_id="12345",
+        client_id="app-id",
+        secret_key="app-secret",
+        redirect_uri="https://service.example/callback/",
+        token_file=tmp_path / "token",
+        market_data_client=_FakeMarketDataClient(),
+        port=_unused_port(),
+        dashboard_state=_DashboardState(),
+        dashboard_enabled=True,
+    )
+    server_thread = threading.Thread(target=service._httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    def request(path, *, method="GET", headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", service.port, timeout=3)
+        connection.request(method, path, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        status = response.status
+        connection.close()
+        return status, body
+
+    try:
+        page_status, page = request("/")
+        api_status, api_body = request("/api/dashboard")
+        post_status, _ = request("/api/dashboard", method="POST")
+
+        assert page_status == 200
+        assert b"NIGHTWATCH" in page
+        assert api_status == 200
+        assert json.loads(api_body) == {"service": {"status": "RUNNING"}, "position": None}
+        assert post_status == 405
+    finally:
+        service._httpd.shutdown()
+        service._httpd.server_close()
+        server_thread.join(timeout=2)

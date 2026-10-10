@@ -11,6 +11,8 @@ from Dependencies.fyers_ema_runner import (
     ActivePosition,
     ClosedPosition,
     _close_position,
+    _dashboard_candles,
+    _dashboard_position,
     _entry_bar_is_fresh,
     _format_day_started_alert,
     _format_entry_alert,
@@ -196,6 +198,81 @@ def test_startup_day_started_and_hourly_health_alert_contents():
     assert "Market data: OK" in health
     assert "Position: FLAT" in health
     assert "Realized P&L today: +₹125.50" in health
+
+
+def test_dashboard_projects_chart_candles_and_open_exposure():
+    timestamp = pd.Timestamp("2026-10-12 09:25:00", tz=IST)
+    frame = pd.DataFrame(
+        [
+            {
+                "timestamp": timestamp,
+                "open": 24000.0,
+                "high": 24020.0,
+                "low": 23995.0,
+                "close": 24010.0,
+                "ema4": 24005.0,
+                "ema11": 23998.0,
+                "ema18": 23990.0,
+            }
+        ]
+    )
+    position = ActivePosition(
+        direction="LONG",
+        contract=FyersOptionContract(
+            "NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65
+        ),
+        quantity=65,
+        entry_underlying=24010.0,
+        stop_underlying=23998.0,
+        entry_option_price=100.0,
+        placed_at=datetime(2026, 10, 12, 9, 26, tzinfo=IST),
+    )
+
+    candle = _dashboard_candles(frame)[0]
+    exposure = _dashboard_position(position, 112.0)
+
+    assert candle["time"] == int(timestamp.timestamp())
+    assert candle["close"] == 24010.0
+    assert candle["ema_mid"] == 23998.0
+    assert exposure["display_symbol"] == "NIFTY-Oct2026-24000-CE"
+    assert exposure["open_pnl"] == 780.0
+    assert _dashboard_position(None, None) is None
+
+
+def test_dashboard_projects_ema_chart_and_open_position_data():
+    timestamp = pd.Timestamp("2026-10-12 09:25:00", tz=IST)
+    frame = pd.DataFrame(
+        [
+            {
+                "timestamp": timestamp,
+                "open": 24000.0,
+                "high": 24020.0,
+                "low": 23995.0,
+                "close": 24010.0,
+                "ema4": 24005.0,
+                "ema11": 23998.0,
+                "ema18": 23990.0,
+            }
+        ]
+    )
+    candle = _dashboard_candles(frame)[0]
+    position = ActivePosition(
+        direction="LONG",
+        contract=FyersOptionContract("NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65),
+        quantity=65,
+        entry_underlying=24010.0,
+        stop_underlying=23998.0,
+        entry_option_price=100.0,
+        placed_at=datetime(2026, 10, 12, 9, 26, tzinfo=IST),
+    )
+    dashboard_position = _dashboard_position(position, 112.0)
+
+    assert candle["time"] == int(timestamp.timestamp())
+    assert candle["close"] == 24010.0
+    assert candle["ema_mid"] == 23998.0
+    assert dashboard_position["display_symbol"] == "NIFTY-Oct2026-24000-CE"
+    assert dashboard_position["open_pnl"] == 780.0
+    assert _dashboard_position(None, None) is None
 
 
 def test_runner_reports_fatal_error_to_telegram_then_reraises(monkeypatch):
