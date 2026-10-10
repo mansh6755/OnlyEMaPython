@@ -12,11 +12,14 @@ from Dependencies.fyers_ema_runner import (
     ClosedPosition,
     _close_position,
     _entry_bar_is_fresh,
+    _format_day_started_alert,
     _format_entry_alert,
     _format_eod_alert,
     _format_error_alert,
     _format_exit_alert,
+    _format_health_alert,
     _format_pnl,
+    _format_strategy_started_alert,
     completed_five_minute_bars,
     daily_loss_limit_reached,
 )
@@ -171,6 +174,28 @@ def test_error_alert_includes_traceback_and_redacts_access_token(monkeypatch):
     assert secret not in alert
     assert "<redacted>" in alert
     assert len(alert) < 4096
+
+
+def test_startup_day_started_and_hourly_health_alert_contents():
+    startup_at = datetime(2026, 10, 12, 9, 20, tzinfo=IST)
+    fetch_at = datetime(2026, 10, 12, 9, 25, tzinfo=IST)
+    heartbeat_at = datetime(2026, 10, 12, 10, 25, tzinfo=IST)
+
+    startup = _format_strategy_started_alert("PAPER", "NSE:NIFTY50-INDEX", 1, startup_at)
+    day_started = _format_day_started_alert("PAPER", startup_at.date(), 375, 75, fetch_at)
+    health = _format_health_alert("PAPER", None, 125.5, "OK", fetch_at, heartbeat_at)
+
+    assert "Strategy started successfully" in startup
+    assert "Underlying: NSE:NIFTY50-INDEX" in startup
+    assert "Lots: 1" in startup
+    assert "Day started successfully" in day_started
+    assert "fetched 375 one-minute bar(s)" in day_started
+    assert "75 completed five-minute bar(s)" in day_started
+    assert "HEALTH · EMA" in health
+    assert "Status: RUNNING" in health
+    assert "Market data: OK" in health
+    assert "Position: FLAT" in health
+    assert "Realized P&L today: +₹125.50" in health
 
 
 def test_runner_reports_fatal_error_to_telegram_then_reraises(monkeypatch):

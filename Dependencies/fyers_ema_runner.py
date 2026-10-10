@@ -152,6 +152,62 @@ def _notify_runner_error(
     )
 
 
+def _format_strategy_started_alert(mode: str, underlying_symbol: str, lots: int, at: datetime) -> str:
+    return (
+        f"✅ Strategy started successfully · EMA\n"
+        f"Mode: {mode}\n"
+        f"Underlying: {underlying_symbol}\n"
+        f"Lots: {lots}\n"
+        f"Time: {at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def _format_day_started_alert(
+    mode: str,
+    trading_day: date,
+    minute_bar_count: int,
+    completed_bar_count: int,
+    at: datetime,
+) -> str:
+    return (
+        f"📅 Day started successfully · EMA\n"
+        f"Mode: {mode}\n"
+        f"Trading day: {trading_day.isoformat()}\n"
+        f"Fyers API: fetched {minute_bar_count} one-minute bar(s)\n"
+        f"Strategy data: {completed_bar_count} completed five-minute bar(s)\n"
+        f"Time: {at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def _format_health_alert(
+    mode: str,
+    position: ActivePosition | None,
+    realized_pnl: float,
+    market_data_status: str,
+    last_market_data_at: datetime | None,
+    at: datetime,
+) -> str:
+    position_status = (
+        f"{position.direction} {_display_instrument(position.contract)} x {position.quantity}"
+        if position is not None
+        else "FLAT"
+    )
+    last_data = (
+        f"{last_market_data_at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+        if last_market_data_at is not None
+        else "not received yet"
+    )
+    return (
+        f"💓 HEALTH · EMA\n"
+        f"Status: RUNNING\n"
+        f"Mode: {mode}\n"
+        f"Time: {at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST\n"
+        f"Market data: {market_data_status} (last success: {last_data})\n"
+        f"Position: {position_status}\n"
+        f"Realized P&L today: {_format_pnl(realized_pnl)}"
+    )
+
+
 def _positive_int(name: str, default: int) -> int:
     raw = os.getenv(name, str(default)).strip()
     try:
@@ -306,11 +362,36 @@ def _run_ema_runner(
     completed_trades = 0
     active_date: date | None = None
     last_processed: pd.Timestamp | None = None
+    startup_at = datetime.now(IST)
+    next_health_at = startup_at + timedelta(hours=1)
+    market_data_status = "WAITING FOR FIRST FETCH"
+    last_market_data_at: datetime | None = None
+    day_started_notified_date: date | None = None
+    notifier.notify(
+        _format_strategy_started_alert(
+            "LIVE" if live_enabled else "PAPER",
+            underlying_symbol,
+            lots,
+            startup_at,
+        )
+    )
     LOGGER.info("EMA runner connected to Fyers; mode=%s; lots=%s", "LIVE" if live_enabled else "PAPER", lots)
     LOGGER.info("Option policy: next week's listed expiry, ATM, buy CE/PE by EMA direction.")
 
     while True:
         now = datetime.now(IST)
+        if now >= next_health_at:
+            notifier.notify(
+                _format_health_alert(
+                    "LIVE" if live_enabled else "PAPER",
+                    position,
+                    realized_pnl,
+                    market_data_status,
+                    last_market_data_at,
+                    now,
+                )
+            )
+            next_health_at = now + timedelta(hours=1)
         if active_date != now.date():
             active_date = now.date()
             realized_pnl = 0.0
@@ -352,7 +433,10 @@ def _run_ema_runner(
                 start=now.date() - timedelta(days=7),
                 end=now.date(),
             )
+            last_market_data_at = datetime.now(IST)
+            market_data_status = "OK"
         except FyersAPIError as exc:
+            market_data_status = "RETRYING"
             LOGGER.error("Fyers market-data refresh failed; retrying: %s", exc)
             _notify_runner_error(
                 notifier,
@@ -391,6 +475,17 @@ def _run_ema_runner(
             if current_timestamp != last_processed
             else signal_logic.EMATrendDecision()
         )
+        if current_timestamp.date() == now.date() and day_started_notified_date != now.date():
+            notifier.notify(
+                _format_day_started_alert(
+                    "LIVE" if live_enabled else "PAPER",
+                    now.date(),
+                    len(minute_bars),
+                    len(bars),
+                    last_market_data_at or now,
+                )
+            )
+            day_started_notified_date = now.date()
         mark_price: float | None = None
         risk_exit_due = False
         if position is not None:
