@@ -36,6 +36,9 @@ The commands:
                              in Dependencies/.env. Reads its settings from that .env.
       python algo.py run
 
+    fyers-backtest Replay the live EMA process using Fyers index and option history.
+      python algo.py fyers-backtest --start-date 2026-10-15 --end-date 2026-10-15
+
     setup-token  One-time Fyers OAuth login that writes an access token into .env.
                Interactive (opens a browser / asks you to paste a code).
       python algo.py setup-token
@@ -121,6 +124,7 @@ BROKER_DIAGNOSTICS = {
 MASTER_SCRIPT = "nifty_multi_strategy_master.py"
 TOKEN_SETUP_SCRIPT = "Dependencies/fyers_token_setup.py"
 CHECK_ENV_SCRIPT = "Dependencies/check_env_config.py"
+FYERS_EMA_BACKTEST_SCRIPT = "Dependencies/fyers_ema_replay.py"
 
 
 def _run(relative_path: str, forwarded_args: list) -> int:
@@ -193,6 +197,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser(
+        "fyers-backtest",
+        help="Replay the live EMA process with Fyers historical index and option candles.",
+        add_help=False,
+    )
+
+    sub.add_parser(
         "setup-token",
         help="One-time interactive Fyers OAuth login that writes a token into .env.",
     )
@@ -242,6 +252,8 @@ def main(argv=None) -> int:
         return _run(BACKTEST_SCRIPTS[args.strategy], forwarded)
     if args.command == "run":
         return _run(MASTER_SCRIPT, forwarded)
+    if args.command == "fyers-backtest":
+        return _run(FYERS_EMA_BACKTEST_SCRIPT, forwarded)
     if args.command == "setup-token":
         return _run(TOKEN_SETUP_SCRIPT, forwarded)
     if args.command == "diagnose":

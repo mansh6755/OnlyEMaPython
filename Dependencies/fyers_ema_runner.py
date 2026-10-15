@@ -21,6 +21,7 @@ from Dependencies.broker_contract import OrderStatus
 from Dependencies.fyers_api import FyersAPI, FyersAPIError
 from Dependencies.fyers_dashboard_state import FyersDashboardState
 from Dependencies.fyers_execution import FyersExecutionClient
+from Dependencies.fyers_market_data import completed_five_minute_bars
 from Dependencies.fyers_options import FyersOptionContract
 from Dependencies.fyers_telegram_auth import (
     FyersTelegramAuthService,
@@ -167,31 +168,6 @@ def _format_eod_alert(realized_pnl: float, trade_count: int, mode: str, at: date
         "──────────\n"
         f"Total: {_format_pnl(realized_pnl)} ({trade_count} trade(s))"
     )
-
-
-def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
-    required = {"timestamp", "open", "high", "low", "close", "volume"}
-    if not required.issubset(minute_bars.columns):
-        raise ValueError("Fyers minute data is missing required OHLCV columns.")
-    frame = minute_bars.copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-    if frame["timestamp"].dt.tz is None:
-        frame["timestamp"] = frame["timestamp"].dt.tz_localize(IST)
-    else:
-        frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
-    frame = frame.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
-    for column in ("open", "high", "low", "close", "volume"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=["open", "high", "low", "close"])
-    completed_before = pd.Timestamp(now.astimezone(IST)).floor("5min")
-    frame = frame[frame.index < completed_before]
-    bars = frame.resample("5min", label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    )
-    counts = frame["close"].resample("5min", label="left", closed="left").count()
-    bars = bars[(counts == 5) & bars["close"].notna()]
-    return bars.reset_index(names="timestamp")
 
 
 def _format_error_alert(context: str, error: Exception, mode: str) -> str:

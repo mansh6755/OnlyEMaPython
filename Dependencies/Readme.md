@@ -16,6 +16,19 @@ order result stops the runner for manual reconciliation.
 Set up the token with `python algo.py setup-token`. Historical Dhan extractors and
 broker diagnostics remain separate utilities; they are not used by this EMA runner.
 
+## Fyers EMA replay
+`python algo.py fyers-backtest --start-date YYYY-MM-DD --end-date YYYY-MM-DD`
+replays the live EMA process without using the legacy backtest scripts. It uses
+the shared EMA signal logic on complete NIFTY five-minute candles, then uses
+historical candles for the selected Fyers option contract to estimate the
+paper-run quote without looking beyond the simulated action time. Entry/EMA11
+exit actions use the quote at the simulated decision poll, and daily loss is
+checked on each poll. The default poll interval, lots, and
+daily loss limit come from `EMA_POLL_SECONDS`, `EMA_LOTS`, and `EMA_MAX_LOSS`.
+Option candle resolution defaults to `auto` (`5S` for recent history, otherwise
+`1` minute); quote fills are therefore approximations, not guaranteed live fills.
+The command writes an auditable trade CSV and summary under `Backtest Outputs/`.
+
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
 
