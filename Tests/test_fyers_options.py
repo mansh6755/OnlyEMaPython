@@ -4,6 +4,7 @@ import pytest
 
 from Dependencies.fyers_options import (
     select_atm_option,
+    select_nearest_expiry,
     select_next_week_atm_option,
     select_next_week_expiry,
     select_parent_style_atm_option,
@@ -42,6 +43,20 @@ def test_parent_style_expiry_selects_second_listed_expiry_on_or_after_today():
 def test_parent_style_expiry_requires_two_future_listed_expiries():
     with pytest.raises(ValueError, match="fewer than two listed expiries"):
         select_parent_style_expiry(["2026-10-20"], today=date(2026, 10, 9))
+
+
+def test_nearest_expiry_selects_the_first_listed_expiry_on_or_after_today():
+    selected = select_nearest_expiry(
+        ["2026-10-08", "2026-10-20", "2026-10-13", "2026-10-27"],
+        today=date(2026, 10, 9),
+    )
+
+    assert selected == date(2026, 10, 13)
+
+
+def test_nearest_expiry_requires_a_future_listed_contract():
+    with pytest.raises(ValueError, match="no listed expiry"):
+        select_nearest_expiry(["2026-10-08"], today=date(2026, 10, 9))
 
 
 @pytest.mark.parametrize(

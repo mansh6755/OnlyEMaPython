@@ -30,6 +30,7 @@ from Dependencies.fyers_options import (  # noqa: E402
     FyersOptionContract,
     _parse_expiry,
     select_atm_option,
+    select_nearest_expiry,
     select_parent_style_expiry,
 )
 from Dependencies.fyers_telegram_auth import load_persisted_access_token  # noqa: E402
@@ -38,6 +39,22 @@ ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
 OUTPUT_DIR = ROOT_DIR / "Backtest Outputs"
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING_SYMBOL = "NSE:NIFTY50-INDEX"
+UNDERLYING_CONFIGS = {
+    "nifty": {
+        "name": "NIFTY",
+        "symbol": UNDERLYING_SYMBOL,
+        "exchange": "NSE",
+        "strike_step": 50,
+        "expiry_policy": "second",
+    },
+    "sensex": {
+        "name": "SENSEX",
+        "symbol": "BSE:SENSEX-INDEX",
+        "exchange": "BSE",
+        "strike_step": 100,
+        "expiry_policy": "nearest",
+    },
+}
 MARKET_OPEN = time(9, 15)
 ENTRY_START = time(9, 25)
 SQUARE_OFF = time(15, 15)
@@ -234,15 +251,17 @@ def _fetch_index_history(
     start: date,
     end: date,
     history_cache: FyersHistoryCache | None = None,
+    *,
+    underlying_symbol: str = UNDERLYING_SYMBOL,
 ) -> pd.DataFrame:
     frames = []
     for left, right in _history_chunks(start, end):
         if history_cache is None:
-            frame = api.history(UNDERLYING_SYMBOL, resolution="1", start=left, end=right)
+            frame = api.history(underlying_symbol, resolution="1", start=left, end=right)
         else:
             frame = history_cache.history(
                 api,
-                UNDERLYING_SYMBOL,
+                underlying_symbol,
                 resolution="1",
                 start=left,
                 end=right,
@@ -266,12 +285,17 @@ def _active_expiry(row: dict[str, Any]) -> date | None:
         return None
 
 
-def _archived_option_rows(symbols: list[str], expiry: date, lot_size: int) -> list[dict[str, Any]]:
+def _archived_option_rows(
+    symbols: list[str],
+    expiry: date,
+    lot_size: int,
+    underlying: str = "NIFTY",
+) -> list[dict[str, Any]]:
     month = expiry.strftime("%b").upper()
     prefixes = (
-        f"NIFTY{expiry:%y}{expiry.month}{expiry:%d}",
-        f"NIFTY{expiry:%y}{month[0]}{expiry:%d}",
-        f"NIFTY{expiry:%y}{month}",
+        f"{underlying}{expiry:%y}{expiry.month}{expiry:%d}",
+        f"{underlying}{expiry:%y}{month[0]}{expiry:%d}",
+        f"{underlying}{expiry:%y}{month}",
     )
     rows = []
     for symbol in symbols:
@@ -305,21 +329,30 @@ def _resolve_contract(
     expiries: list[date],
     archived_symbols: dict[date, list[str]],
     fallback_lot_size: int,
+    underlying: str = "NIFTY",
+    underlying_symbol: str = UNDERLYING_SYMBOL,
+    strike_step: float = 50,
+    expiry_policy: str = "second",
 ) -> FyersOptionContract:
-    expiry = select_parent_style_expiry(expiries, today=trade_date)
+    if expiry_policy == "nearest":
+        expiry = select_nearest_expiry(expiries, today=trade_date)
+    elif expiry_policy == "second":
+        expiry = select_parent_style_expiry(expiries, today=trade_date)
+    else:
+        raise ValueError(f"Unsupported replay expiry policy: {expiry_policy!r}")
     if expiry < date.today():
         if expiry not in archived_symbols:
-            archived_symbols[expiry] = api.expired_option_symbols(UNDERLYING_SYMBOL, expiry)
-        rows = _archived_option_rows(archived_symbols[expiry], expiry, fallback_lot_size)
+            archived_symbols[expiry] = api.expired_option_symbols(underlying_symbol, expiry)
+        rows = _archived_option_rows(archived_symbols[expiry], expiry, fallback_lot_size, underlying)
     else:
         rows = [
             {**row, "expiry": expiry}
             for row in active_rows
-            if row.get("underlying") == "NIFTY"
+            if row.get("underlying") == underlying
             and row.get("option_type") in {"CE", "PE"}
             and _active_expiry(row) == expiry
         ]
-    return select_atm_option(rows, action=action, spot=spot, expiry=expiry, strike_step=50)
+    return select_atm_option(rows, action=action, spot=spot, expiry=expiry, strike_step=strike_step)
 
 
 def _quote_at(
@@ -391,6 +424,10 @@ def replay(
     poll_seconds: int = 2,
     option_resolution: str = "5S",
     history_cache: FyersHistoryCache | None = None,
+    underlying: str = "NIFTY",
+    underlying_symbol: str = UNDERLYING_SYMBOL,
+    strike_step: float = 50,
+    expiry_policy: str = "second",
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if poll_seconds <= 0 or poll_seconds > 120:
         raise ValueError("poll_seconds must be between 1 and 120.")
@@ -401,7 +438,7 @@ def replay(
     if option_resolution not in OPTION_RESOLUTION_SECONDS:
         raise ValueError(f"Unsupported option resolution: {option_resolution}")
     if index_bars.empty:
-        raise ValueError("Fyers returned no complete NIFTY five-minute bars.")
+        raise ValueError(f"Fyers returned no complete {underlying} five-minute bars.")
 
     enriched = signal_logic.build_ema_trend_with_indicators(index_bars, strategy_config)
     if enriched.empty:
@@ -418,10 +455,10 @@ def replay(
 
     engine = signal_logic.EMATrendSignalEngine(strategy_config)
     eligible_rows = [
-        row for row in active_rows if row.get("underlying") == "NIFTY" and row.get("option_type") in {"CE", "PE"}
+        row for row in active_rows if row.get("underlying") == underlying and row.get("option_type") in {"CE", "PE"}
     ]
     if not eligible_rows:
-        raise RuntimeError("Fyers derivatives master has no NIFTY option contracts.")
+        raise RuntimeError(f"Fyers derivatives master has no {underlying} option contracts.")
     fallback_lot_size = int(eligible_rows[0]["lot_size"])
     archive_cache: dict[date, list[str]] = {}
     option_cache: dict[tuple[str, date], _OptionQuotes] = {}
@@ -591,6 +628,10 @@ def replay(
                 expiries=expiries,
                 archived_symbols=archive_cache,
                 fallback_lot_size=fallback_lot_size,
+                underlying=underlying,
+                underlying_symbol=underlying_symbol,
+                strike_step=strike_step,
+                expiry_policy=expiry_policy,
             )
             quotes = option_day(contract, day)
             entry_at = now
@@ -626,9 +667,13 @@ def _report(
     option_resolution: str,
     poll_seconds: int,
     history_cache: FyersHistoryCache,
+    underlying: str = "NIFTY",
+    expiry_policy: str = "second",
+    strike_step: float = 50,
 ) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"fyers_ema_replay_{start:%Y%m%d}_{end:%Y%m%d}"
+    suffix = f"_{underlying.lower()}" if underlying != "NIFTY" else ""
+    stem = f"fyers_ema_replay{suffix}_{start:%Y%m%d}_{end:%Y%m%d}"
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
     trades.to_csv(trades_path, index=False)
@@ -643,8 +688,8 @@ def _report(
         entry_days = pd.to_datetime(trades["entry_time"], errors="coerce").dt.date.astype(str)
         daily_pnl = trades.assign(entry_day=entry_days).groupby("entry_day")["gross_pnl"].sum().to_dict()
     lines = [
-        f"Live-process Fyers EMA replay: {start} through {end}",
-        "Signals use the shared EMA logic on complete Fyers NIFTY five-minute bars.",
+        f"Live-process Fyers {underlying} EMA replay: {start} through {end}",
+        f"Signals use the shared EMA logic on complete Fyers {underlying} five-minute bars.",
         "Entry and EMA11 exit decisions use the option quote proxy at the same simulated poll; "
         "daily loss is checked on each poll. Quotes use the last completed option candle and are "
         "not guaranteed live fills.",
@@ -652,8 +697,8 @@ def _report(
         f"Historical candle cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner. "
-        "Option expiry and strike follow the parent EMA style: second listed expiry on/after the trade date, "
-        "with spot rounded to the nearest 50 before choosing the closest listed strike.",
+        f"Option expiry policy: {expiry_policy} listed expiry on/after the trade date; "
+        f"spot is rounded to the nearest {strike_step:g}-point strike before choosing the closest listed strike.",
         "P&L is gross, matching the live alert calculation; fees and slippage are not included.",
         "Archived contracts use the current Fyers lot size because historical lot-size metadata "
         "is not supplied by the expired-symbol endpoint.",
@@ -678,6 +723,12 @@ def _report(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay the live Fyers EMA process against historical option candles.")
+    parser.add_argument(
+        "--underlying",
+        choices=tuple(UNDERLYING_CONFIGS),
+        default="nifty",
+        help="Index and option market to replay (default: nifty).",
+    )
     parser.add_argument("--start-date", required=True, help="Inclusive YYYY-MM-DD date.")
     parser.add_argument("--end-date", required=True, help="Inclusive YYYY-MM-DD date.")
     parser.add_argument("--lots", type=int, default=None)
@@ -705,6 +756,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Fetch candles from Fyers and replace matching cache entries.",
     )
     args = parser.parse_args(argv)
+    instrument = UNDERLYING_CONFIGS[args.underlying]
+    underlying = instrument["name"]
+    underlying_symbol = instrument["symbol"]
     try:
         start, end = date.fromisoformat(args.start_date), date.fromisoformat(args.end_date)
     except ValueError as exc:
@@ -776,21 +830,27 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh_cache,
     )
     try:
-        raw_index = _fetch_index_history(api, start - timedelta(days=7), end, history_cache)
+        raw_index = _fetch_index_history(
+            api,
+            start - timedelta(days=7),
+            end,
+            history_cache,
+            underlying_symbol=underlying_symbol,
+        )
         if raw_index.empty:
             raise RuntimeError("Fyers returned no index candles for the selected period.")
         end_of_range = datetime.combine(end + timedelta(days=1), time.min, tzinfo=IST)
         index_bars = completed_five_minute_bars(raw_index, end_of_range)
-        active_rows = api.option_master()
+        active_rows = api.option_master(exchange=instrument["exchange"])
         active_expiries = {
             expiry
             for row in active_rows
-            if row.get("underlying") == "NIFTY" and (expiry := _active_expiry(row)) is not None
+            if row.get("underlying") == underlying and (expiry := _active_expiry(row)) is not None
         }
         archived_expiries: list[date] = []
         if start <= query_end:
             for left, right in _history_chunks(start, query_end):
-                archived_expiries.extend(api.expired_option_expiries(UNDERLYING_SYMBOL, left, right))
+                archived_expiries.extend(api.expired_option_expiries(underlying_symbol, left, right))
         expiries = sorted(active_expiries | set(archived_expiries))
         trades, counters = replay(
             signal_logic=logic,
@@ -806,10 +866,25 @@ def main(argv: list[str] | None = None) -> int:
             poll_seconds=poll_seconds,
             option_resolution=option_resolution,
             history_cache=history_cache,
+            underlying=underlying,
+            underlying_symbol=underlying_symbol,
+            strike_step=instrument["strike_step"],
+            expiry_policy=instrument["expiry_policy"],
         )
     except (FyersAPIError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
-    _report(trades, counters, start, end, option_resolution, poll_seconds, history_cache)
+    _report(
+        trades,
+        counters,
+        start,
+        end,
+        option_resolution,
+        poll_seconds,
+        history_cache,
+        underlying,
+        instrument["expiry_policy"],
+        instrument["strike_step"],
+    )
     return 0
 
 

@@ -27,6 +27,8 @@ API_BASE = "https://api-t1.fyers.in/api/v3"
 DATA_BASE = "https://api-t1.fyers.in/data"
 IST = ZoneInfo("Asia/Kolkata")
 NSE_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
+BSE_FO_MASTER_URL = "https://public.fyers.in/sym_details/BSE_FO.csv"
+FO_MASTER_URLS = {"NSE": NSE_FO_MASTER_URL, "BSE": BSE_FO_MASTER_URL}
 
 
 class FyersAPIError(RuntimeError):
@@ -80,7 +82,7 @@ def _unwrap_data(response: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else response
 
 
-def parse_nse_fo_master(content: str) -> list[dict[str, Any]]:
+def _parse_fo_master(content: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for fields in csv.reader(StringIO(content)):
         if len(fields) < 17:
@@ -107,6 +109,14 @@ def parse_nse_fo_master(content: str) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def parse_nse_fo_master(content: str) -> list[dict[str, Any]]:
+    return _parse_fo_master(content)
+
+
+def parse_bse_fo_master(content: str) -> list[dict[str, Any]]:
+    return _parse_fo_master(content)
 
 
 def exchange_auth_code(
@@ -157,7 +167,7 @@ class FyersAPI:
             "Content-Type": "application/json",
             "version": "3",
         }
-        self._option_master_cache: list[dict[str, Any]] | None = None
+        self._option_master_cache: dict[str, list[dict[str, Any]]] = {}
         self._last_get_started = 0.0
 
     def replace_access_token(self, token: str, *, persist: Callable[[str], None]) -> None:
@@ -350,19 +360,23 @@ class FyersAPI:
             },
         )
 
-    def option_master(self) -> list[dict[str, Any]]:
-        if self._option_master_cache is not None:
-            return self._option_master_cache
+    def option_master(self, exchange: str = "NSE") -> list[dict[str, Any]]:
+        exchange_code = str(exchange).strip().upper()
+        master_url = FO_MASTER_URLS.get(exchange_code)
+        if master_url is None:
+            raise ValueError(f"Unsupported Fyers derivatives exchange: {exchange!r}")
+        if exchange_code in self._option_master_cache:
+            return self._option_master_cache[exchange_code]
         try:
-            response = self.session.get(NSE_FO_MASTER_URL, timeout=self.timeout)
+            response = self.session.get(master_url, timeout=self.timeout)
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise FyersAPIError("Unable to download the Fyers NSE derivatives master.") from exc
+            raise FyersAPIError(f"Unable to download the Fyers {exchange_code} derivatives master.") from exc
 
-        rows = parse_nse_fo_master(response.text)
+        rows = _parse_fo_master(response.text)
         if not rows:
-            raise FyersAPIError("Fyers NSE derivatives master contained no usable contracts.")
-        self._option_master_cache = rows
+            raise FyersAPIError(f"Fyers {exchange_code} derivatives master contained no usable contracts.")
+        self._option_master_cache[exchange_code] = rows
         return rows
 
     def resolve_next_week_option(

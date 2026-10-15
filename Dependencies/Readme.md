@@ -23,7 +23,7 @@ broker diagnostics remain separate utilities; they are not used by this EMA runn
 ## Fyers EMA replay
 `python algo.py fyers-backtest --start-date YYYY-MM-DD --end-date YYYY-MM-DD`
 replays the live EMA process without using the legacy backtest scripts. It uses
-the shared EMA signal logic on complete NIFTY five-minute candles, then uses
+the shared EMA signal logic on complete index five-minute candles, then uses
 historical candles for the selected Fyers option contract to estimate the
 paper-run quote without looking beyond the simulated action time. Entry/EMA11
 exit actions use the quote at the simulated decision poll, and daily loss is
@@ -41,6 +41,11 @@ EMA expiry and strike-selection rules. Use `--useCache=true` to enable cache,
 `--useCache=false` (or `--no-cache`) to fetch candles directly without reading or
 writing cache, or `--refresh-cache` to fetch and replace cached candles. The
 command writes an auditable trade CSV and summary under `Backtest Outputs/`.
+Pass `--underlying sensex` to replay BSE SENSEX index and option data; the default
+remains NIFTY. SENSEX uses the BSE derivatives master and 100-point ATM strike
+steps, selects the nearest listed expiry (the second-upcoming contract has
+missing archived quotes on early January sessions), and writes reports to
+separate filenames.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.

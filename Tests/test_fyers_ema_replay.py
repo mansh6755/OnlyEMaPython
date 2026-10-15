@@ -7,6 +7,7 @@ import pytest
 from Dependencies.fyers_ema_replay import (
     FyersHistoryCache,
     _action_polls,
+    _archived_option_rows,
     _expiry_lookup_end,
     _parse_cache_flag,
     _quote_at,
@@ -82,6 +83,32 @@ def test_poll_schedule_includes_the_first_poll_after_square_off():
 def test_expiry_lookup_includes_the_following_week_after_the_replay_end():
     assert _expiry_lookup_end(date(2026, 2, 28), date(2026, 10, 15)) == date(2026, 3, 14)
     assert _expiry_lookup_end(date(2026, 10, 15), date(2026, 10, 15)) == date(2026, 10, 14)
+
+
+def test_archived_sensex_symbols_are_resolved_with_the_bse_prefix_and_lot_size():
+    rows = _archived_option_rows(
+        ["BSE:SENSEX2612285800CE", "BSE:SENSEX2612285800PE"],
+        date(2026, 1, 22),
+        20,
+        underlying="SENSEX",
+    )
+
+    assert rows == [
+        {
+            "symbol": "BSE:SENSEX2612285800CE",
+            "option_type": "CE",
+            "strike_price": 85800.0,
+            "lot_size": 20,
+            "expiry": date(2026, 1, 22),
+        },
+        {
+            "symbol": "BSE:SENSEX2612285800PE",
+            "option_type": "PE",
+            "strike_price": 85800.0,
+            "lot_size": 20,
+            "expiry": date(2026, 1, 22),
+        },
+    ]
 
 
 def test_use_cache_flag_accepts_true_or_false_values():
@@ -290,6 +317,75 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     assert trades.iloc[0]["gross_pnl"] == 650.0
     assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
     assert api.requests[0][0] == "NSE:NIFTY26O2722500CE"
+
+
+def test_replay_can_use_sensex_option_contracts_without_changing_nifty_defaults():
+    day = date(2026, 10, 15)
+    timestamps = pd.date_range(
+        "2026-10-15T09:15:00+05:30",
+        "2026-10-15T15:15:00+05:30",
+        freq="5s",
+    )
+    option_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 110.0,
+            "low": 99.0,
+            "close": [100.0 if stamp < pd.Timestamp("2026-10-15T09:34:55+05:30") else 110.0 for stamp in timestamps],
+            "volume": 1,
+        }
+    )
+    index_bars = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-10-15T09:25:00+05:30", "2026-10-15T09:30:00+05:30"]),
+            "open": [82500.0, 82510.0],
+            "high": [82520.0, 82520.0],
+            "low": [82490.0, 82500.0],
+            "close": [82510.0, 82505.0],
+            "volume": [5, 5],
+        }
+    )
+    api = _FakeAPI(option_bars)
+    active_rows = [
+        {
+            "underlying": "SENSEX",
+            "symbol": "BSE:SENSEX26O2082500CE",
+            "expiry": date(2026, 10, 20),
+            "strike_price": 82500.0,
+            "option_type": "CE",
+            "lot_size": 20,
+        },
+        {
+            "underlying": "SENSEX",
+            "symbol": "BSE:SENSEX26O2782500CE",
+            "expiry": date(2026, 10, 27),
+            "strike_price": 82500.0,
+            "option_type": "CE",
+            "lot_size": 20,
+        },
+    ]
+
+    trades, counters = replay(
+        signal_logic=_FakeLogic,
+        strategy_config=None,
+        index_bars=index_bars,
+        api=api,
+        active_rows=active_rows,
+        expiries=[date(2026, 10, 20), date(2026, 10, 27)],
+        start=day,
+        end=day,
+        underlying="SENSEX",
+        underlying_symbol="BSE:SENSEX-INDEX",
+        strike_step=100,
+        expiry_policy="nearest",
+    )
+
+    assert counters == {"signals": 1, "entries": 1, "exits": 1, "daily_loss_halts": 0}
+    assert trades.iloc[0]["symbol"] == "BSE:SENSEX26O2082500CE"
+    assert trades.iloc[0]["quantity"] == 20
+    assert trades.iloc[0]["gross_pnl"] == 200.0
+    assert api.requests[0][0] == "BSE:SENSEX26O2082500CE"
 
 
 def test_daily_max_loss_exits_position_and_resets_for_the_next_day():

@@ -3,7 +3,14 @@ from datetime import UTC, datetime
 
 import pytest
 
-from Dependencies.fyers_api import FyersAPI, FyersAPIError, build_auth_url, parse_nse_fo_master, quote_ltp
+from Dependencies.fyers_api import (
+    FyersAPI,
+    FyersAPIError,
+    build_auth_url,
+    parse_bse_fo_master,
+    parse_nse_fo_master,
+    quote_ltp,
+)
 
 
 class _Response:
@@ -72,6 +79,27 @@ def test_parse_nse_fo_master_reads_exact_symbol_and_lot_size_columns():
             "strike_price": 17350.0,
             "option_type": "CE",
             "lot_size": 65,
+        }
+    ]
+
+
+def test_parse_bse_fo_master_reads_sensex_symbol_and_lot_size_columns():
+    row = (
+        "12112610151100737,SENSEX 15 Oct 26 82200 CE,14,20,0.05,,0915-1540:,"
+        "2026-10-14,1792059000,BSE:SENSEX26O1582200CE,12,11,1100737,SENSEX,1,"
+        "82200.0,CE,12100000001,None,0,0.0"
+    )
+
+    contracts = parse_bse_fo_master(row)
+
+    assert contracts == [
+        {
+            "symbol": "BSE:SENSEX26O1582200CE",
+            "underlying": "SENSEX",
+            "expiry": 1792059000,
+            "strike_price": 82200.0,
+            "option_type": "CE",
+            "lot_size": 20,
         }
     ]
 
