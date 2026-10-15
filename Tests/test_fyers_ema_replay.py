@@ -80,7 +80,7 @@ def test_poll_schedule_includes_the_first_poll_after_square_off():
 
 
 def test_expiry_lookup_includes_the_following_week_after_the_replay_end():
-    assert _expiry_lookup_end(date(2026, 2, 28), date(2026, 10, 15)) == date(2026, 3, 7)
+    assert _expiry_lookup_end(date(2026, 2, 28), date(2026, 10, 15)) == date(2026, 3, 14)
     assert _expiry_lookup_end(date(2026, 10, 15), date(2026, 10, 15)) == date(2026, 10, 14)
 
 
@@ -258,8 +258,8 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     active_rows = [
         {
             "underlying": "NIFTY",
-            "symbol": "NSE:NIFTY26O2022500CE",
-            "expiry": date(2026, 10, 20),
+            "symbol": "NSE:NIFTY26O2722500CE",
+            "expiry": date(2026, 10, 27),
             "strike_price": 22500.0,
             "option_type": "CE",
             "lot_size": 65,
@@ -272,7 +272,7 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
         index_bars=index_bars,
         api=api,
         active_rows=active_rows,
-        expiries=[date(2026, 10, 20)],
+        expiries=[date(2026, 10, 20), date(2026, 10, 27)],
         start=day,
         end=day,
     )
@@ -289,7 +289,7 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     assert trades.iloc[0]["quantity"] == 65
     assert trades.iloc[0]["gross_pnl"] == 650.0
     assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
-    assert api.requests[0][0] == "NSE:NIFTY26O2022500CE"
+    assert api.requests[0][0] == "NSE:NIFTY26O2722500CE"
 
 
 def test_daily_max_loss_exits_position_and_resets_for_the_next_day():
@@ -346,8 +346,8 @@ def test_daily_max_loss_exits_position_and_resets_for_the_next_day():
     active_rows = [
         {
             "underlying": "NIFTY",
-            "symbol": "NSE:NIFTY26O2022500CE",
-            "expiry": date(2026, 10, 20),
+            "symbol": "NSE:NIFTY26O2722500CE",
+            "expiry": date(2026, 10, 27),
             "strike_price": 22500.0,
             "option_type": "CE",
             "lot_size": 65,
@@ -360,7 +360,7 @@ def test_daily_max_loss_exits_position_and_resets_for_the_next_day():
         index_bars=index_bars,
         api=api,
         active_rows=active_rows,
-        expiries=[date(2026, 10, 20)],
+        expiries=[date(2026, 10, 20), date(2026, 10, 27)],
         start=days[0],
         end=days[1],
         max_daily_loss=5500.0,

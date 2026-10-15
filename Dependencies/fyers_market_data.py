@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from Dependencies.market_data_health import complete_minute_bucket_mask
+
 IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -28,6 +30,8 @@ def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.D
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     completed_before = pd.Timestamp(now.astimezone(IST)).floor("5min")
     frame = frame[frame.index < completed_before]
+    complete = complete_minute_bucket_mask(pd.DatetimeIndex(frame.index), 5)
+    frame = frame.loc[complete.to_numpy()]
     bars = frame.resample("5min", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )

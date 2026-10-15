@@ -30,7 +30,7 @@ from Dependencies.fyers_options import (  # noqa: E402
     FyersOptionContract,
     _parse_expiry,
     select_atm_option,
-    select_next_week_expiry,
+    select_parent_style_expiry,
 )
 from Dependencies.fyers_telegram_auth import load_persisted_access_token  # noqa: E402
 
@@ -99,8 +99,8 @@ def _history_chunks(start: date, end: date) -> list[tuple[date, date]]:
 
 
 def _expiry_lookup_end(end: date, today: date) -> date:
-    """Include next-week expiries needed by signals near the end of the replay."""
-    return min(end + timedelta(days=7), today - timedelta(days=1))
+    """Include the second upcoming expiry needed by parent-style EMA entries."""
+    return min(end + timedelta(days=14), today - timedelta(days=1))
 
 
 def _parse_cache_flag(value: str) -> bool:
@@ -306,7 +306,7 @@ def _resolve_contract(
     archived_symbols: dict[date, list[str]],
     fallback_lot_size: int,
 ) -> FyersOptionContract:
-    expiry = select_next_week_expiry(expiries, today=trade_date)
+    expiry = select_parent_style_expiry(expiries, today=trade_date)
     if expiry < date.today():
         if expiry not in archived_symbols:
             archived_symbols[expiry] = api.expired_option_symbols(UNDERLYING_SYMBOL, expiry)
@@ -319,7 +319,7 @@ def _resolve_contract(
             and row.get("option_type") in {"CE", "PE"}
             and _active_expiry(row) == expiry
         ]
-    return select_atm_option(rows, action=action, spot=spot, expiry=expiry)
+    return select_atm_option(rows, action=action, spot=spot, expiry=expiry, strike_step=50)
 
 
 def _quote_at(
@@ -388,7 +388,7 @@ def replay(
     end: date,
     lots: int = 1,
     max_daily_loss: float = 5500.0,
-    poll_seconds: int = 30,
+    poll_seconds: int = 2,
     option_resolution: str = "5S",
     history_cache: FyersHistoryCache | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -651,7 +651,9 @@ def _report(
         f"Option candle resolution: {option_resolution}; simulated poll interval: {poll_seconds}s.",
         f"Historical candle cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
-        "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner.",
+        "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner. "
+        "Option expiry and strike follow the parent EMA style: second listed expiry on/after the trade date, "
+        "with spot rounded to the nearest 50 before choosing the closest listed strike.",
         "P&L is gross, matching the live alert calculation; fees and slippage are not included.",
         "Archived contracts use the current Fyers lot size because historical lot-size metadata "
         "is not supplied by the expired-symbol endpoint.",
@@ -733,7 +735,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         lots = args.lots if args.lots is not None else int(os.getenv("EMA_LOTS", "1"))
-        poll_seconds = args.poll_seconds if args.poll_seconds is not None else int(os.getenv("EMA_POLL_SECONDS", "30"))
+        poll_seconds = args.poll_seconds if args.poll_seconds is not None else int(os.getenv("EMA_POLL_SECONDS", "2"))
         max_daily_loss = (
             args.max_daily_loss if args.max_daily_loss is not None else float(os.getenv("EMA_MAX_LOSS", "5500"))
         )
@@ -741,8 +743,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"Invalid EMA replay configuration: {exc}")
     if lots <= 0 or poll_seconds <= 0 or not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
         parser.error("lots, poll-seconds, and max-daily-loss must be positive; loss must be finite.")
-    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_WEEK").strip().upper() != "NEXT_WEEK":
-        parser.error("This replay supports EMA_OPTION_EXPIRY_POLICY=NEXT_WEEK only.")
+    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_NEXT").strip().upper() != "NEXT_NEXT":
+        parser.error("This replay supports EMA_OPTION_EXPIRY_POLICY=NEXT_NEXT only.")
     if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
         parser.error("This replay supports EMA_OPTION_STRIKE_POLICY=ATM only.")
     option_resolution = args.option_resolution

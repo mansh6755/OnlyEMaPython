@@ -17,7 +17,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from Dependencies.fyers_options import FyersOptionContract, select_next_week_atm_option
+from Dependencies.fyers_options import (
+    FyersOptionContract,
+    select_next_week_atm_option,
+    select_parent_style_atm_option,
+)
 
 API_BASE = "https://api-t1.fyers.in/api/v3"
 DATA_BASE = "https://api-t1.fyers.in/data"
@@ -376,6 +380,27 @@ class FyersAPI:
             and row["option_type"] in {"CE", "PE"}
         ]
         return select_next_week_atm_option(options, action=action, spot=spot, today=today)
+
+    def resolve_parent_style_option(
+        self,
+        action: str,
+        *,
+        spot: float,
+        today: date,
+        underlying: str = "NIFTY",
+    ) -> FyersOptionContract:
+        options = [
+            row
+            for row in self.option_master()
+            if row["underlying"] == underlying.upper()
+            and row["option_type"] in {"CE", "PE"}
+        ]
+        return select_parent_style_atm_option(
+            options,
+            action=action,
+            spot=spot,
+            today=today,
+        )
 
     def positions(self) -> dict[str, Any]:
         return self._request("GET", API_BASE, "/positions")

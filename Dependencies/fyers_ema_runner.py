@@ -389,12 +389,12 @@ def _run_ema_runner(
     underlying_symbol = os.getenv("FYERS_UNDERLYING_SYMBOL", "NSE:NIFTY50-INDEX").strip()
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
     lots = _positive_int("EMA_LOTS", 1)
-    poll_seconds = _positive_int("EMA_POLL_SECONDS", 30)
+    poll_seconds = _positive_int("EMA_POLL_SECONDS", 2)
     max_daily_loss = float(os.getenv("EMA_MAX_LOSS", "5500"))
     if not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
         raise ValueError("EMA_MAX_LOSS must be finite and positive.")
-    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_WEEK").strip().upper() != "NEXT_WEEK":
-        raise RuntimeError("This runner currently supports EMA_OPTION_EXPIRY_POLICY=NEXT_WEEK only.")
+    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_NEXT").strip().upper() != "NEXT_NEXT":
+        raise RuntimeError("This runner currently supports EMA_OPTION_EXPIRY_POLICY=NEXT_NEXT only.")
     if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
         raise RuntimeError("This runner currently supports EMA_OPTION_STRIKE_POLICY=ATM only.")
 
@@ -718,7 +718,7 @@ def _run_ema_runner(
             if realized_pnl <= -max_daily_loss:
                 LOGGER.warning("Daily loss limit reached; new EMA entries are disabled.")
             elif entry_window:
-                contract = api.resolve_next_week_option(
+                contract = api.resolve_parent_style_option(
                     decision.action,
                     spot=float(current["close"]),
                     today=now.date(),

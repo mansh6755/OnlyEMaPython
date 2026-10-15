@@ -68,22 +68,47 @@ def select_next_week_expiry(expiries: Iterable[Any], *, today: date) -> date:
     return min(candidates)
 
 
+def select_parent_style_expiry(expiries: Iterable[Any], *, today: date) -> date:
+    """Select the second listed expiry on or after today, like the parent EMA worker."""
+    candidates: set[date] = set()
+    for item in expiries:
+        value = (item.get("date") or item.get("expiry")) if isinstance(item, dict) else item
+        if value is None:
+            continue
+        try:
+            expiry = _parse_expiry(value)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if expiry >= today:
+            candidates.add(expiry)
+    ordered = sorted(candidates)
+    if len(ordered) < 2:
+        raise ValueError(f"Fyers returned fewer than two listed expiries on or after {today}.")
+    return ordered[1]
+
+
 def select_atm_option(
     options: Iterable[dict[str, Any]],
     *,
     action: str,
     spot: float,
     expiry: date,
+    strike_step: float | None = None,
 ) -> FyersOptionContract:
-    """Choose the nearest ATM CE/PE; ties resolve to the lower strike."""
+    """Choose the nearest CE/PE strike; ties resolve to the lower strike."""
     direction = str(action).strip().upper()
-    option_type = {"ENTER_LONG": "CE", "LONG": "CE", "ENTER_SHORT": "PE", "SHORT": "PE"}.get(
-        direction
-    )
+    option_type = {"ENTER_LONG": "CE", "LONG": "CE", "ENTER_SHORT": "PE", "SHORT": "PE"}.get(direction)
     if option_type is None:
         raise ValueError(f"Unsupported EMA entry action: {action!r}")
     if isinstance(spot, bool) or not isfinite(float(spot)) or float(spot) <= 0:
         raise ValueError("Underlying spot price must be finite and positive.")
+    if strike_step is not None and (
+        isinstance(strike_step, bool) or not isfinite(float(strike_step)) or float(strike_step) <= 0
+    ):
+        raise ValueError("strike_step must be finite and positive when supplied.")
+    target_strike = (
+        float(round(float(spot) / float(strike_step)) * float(strike_step)) if strike_step is not None else float(spot)
+    )
 
     candidates: list[tuple[float, float, FyersOptionContract]] = []
     for row in options:
@@ -109,11 +134,38 @@ def select_atm_option(
         ):
             continue
         contract = FyersOptionContract(symbol, expiry, option_type, strike, lot_size)
-        candidates.append((abs(strike - float(spot)), strike, contract))
+        candidates.append((abs(strike - target_strike), strike, contract))
 
     if not candidates:
         raise ValueError(f"Fyers option chain has no valid {option_type} contracts.")
     return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+
+
+def select_parent_style_atm_option(
+    options: Iterable[dict[str, Any]],
+    *,
+    action: str,
+    spot: float,
+    today: date,
+) -> FyersOptionContract:
+    """Select second-upcoming expiry and parent-style rounded ATM strike."""
+    rows = [row for row in options if isinstance(row, dict)]
+    expiry = select_parent_style_expiry((row.get("expiry") for row in rows), today=today)
+    expiry_rows = []
+    for row in rows:
+        try:
+            row_expiry = _parse_expiry(row.get("expiry"))
+        except (OverflowError, OSError, ValueError):
+            continue
+        if row_expiry == expiry:
+            expiry_rows.append(row)
+    return select_atm_option(
+        expiry_rows,
+        action=action,
+        spot=spot,
+        expiry=expiry,
+        strike_step=50,
+    )
 
 
 def select_next_week_atm_option(

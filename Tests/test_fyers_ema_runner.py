@@ -57,6 +57,29 @@ def test_completed_five_minute_bars_aggregates_only_closed_full_bars():
     assert result.iloc[0]["volume"] == 60
 
 
+def test_completed_five_minute_bars_rejects_five_rows_not_aligned_to_exact_minutes():
+    timestamps = pd.date_range("2026-10-09 09:15", periods=5, freq="min", tz=IST)
+    timestamps = timestamps.to_list()
+    timestamps[-1] += pd.Timedelta(seconds=1)
+    minute_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100, 101, 102, 103, 104],
+            "high": [101, 102, 103, 104, 105],
+            "low": [99, 100, 101, 102, 103],
+            "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "volume": [10, 11, 12, 13, 14],
+        }
+    )
+
+    result = completed_five_minute_bars(
+        minute_bars,
+        datetime(2026, 10, 9, 9, 22, tzinfo=IST),
+    )
+
+    assert result.empty
+
+
 def test_daily_loss_limit_includes_unrealized_option_loss():
     assert daily_loss_limit_reached(
         realized_pnl=-1000,
@@ -101,9 +124,7 @@ def test_live_square_off_submits_before_needing_a_quote():
 
     position = ActivePosition(
         direction="LONG",
-        contract=FyersOptionContract(
-            "NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65
-        ),
+        contract=FyersOptionContract("NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65),
         quantity=65,
         entry_underlying=24000,
         stop_underlying=23950,
@@ -128,9 +149,7 @@ def test_live_square_off_submits_before_needing_a_quote():
 def test_telegram_trade_alerts_match_requested_layout_and_show_placement_time():
     position = ActivePosition(
         direction="SHORT",
-        contract=FyersOptionContract(
-            "NSE:NIFTY26O1323350PE", date(2026, 10, 13), "PE", 23350, 65
-        ),
+        contract=FyersOptionContract("NSE:NIFTY26O1323350PE", date(2026, 10, 13), "PE", 23350, 65),
         quantity=65,
         entry_underlying=23400,
         stop_underlying=23450,
@@ -218,9 +237,7 @@ def test_dashboard_projects_chart_candles_and_open_exposure():
     )
     position = ActivePosition(
         direction="LONG",
-        contract=FyersOptionContract(
-            "NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65
-        ),
+        contract=FyersOptionContract("NSE:NIFTY26O1324000CE", date(2026, 10, 13), "CE", 24000, 65),
         quantity=65,
         entry_underlying=24010.0,
         stop_underlying=23998.0,

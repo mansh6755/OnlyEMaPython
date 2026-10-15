@@ -4,8 +4,12 @@
 `python algo.py run` starts the EMA strategy in [nifty_multi_strategy_master.py](../nifty_multi_strategy_master.py).
 It gets NIFTY one-minute candles and option contracts from Fyers, resamples completed
 five-minute bars, and applies the shared EMA signal logic. Bullish signals buy one
-ATM CE and bearish signals buy one ATM PE for the first listed expiry in the next
-ISO week. Contract symbols and lot sizes come from Fyers' NSE derivatives master.
+ATM CE and bearish signals buy one ATM PE for the second listed expiry on or after
+the trading date, matching the parent EMA worker. Spot is rounded to the nearest
+50-point strike before the closest listed strike is selected; ties go to the lower
+strike. The default poll interval is 2 seconds, matching the parent. Fyers remains
+the data provider, so its candles and quotes will not necessarily match the parent's
+Dhan feed. Contract symbols and lot sizes come from Fyers' NSE derivatives master.
 
 The runner is paper-only by default. To enable real orders, configure the Fyers
 credentials below and explicitly set `LIVE_TRADING_ENABLED=true` in the ignored
@@ -28,11 +32,12 @@ trading day and includes realized P&L plus the open position's estimated P&L;
 once reached, the open trade exits and further entries are blocked for that day.
 Since checks use the simulated poll schedule and completed option candles, a
 loss can cross the threshold between checks. The default poll interval and lots
-come from `EMA_POLL_SECONDS` and `EMA_LOTS`.
+come from `EMA_POLL_SECONDS` (default 2 seconds) and `EMA_LOTS`.
 Option candle resolution defaults to `auto` (`5S` for recent history, otherwise
 `1` minute); quote fills are therefore approximations, not guaranteed live fills.
 Historical candles are cached persistently under `Backtest Outputs/.fyers_cache/`
-by default (`EMA_REPLAY_USE_CACHE=true`). Use `--useCache=true` to enable cache,
+by default (`EMA_REPLAY_USE_CACHE=true`). The replay also follows the parent
+EMA expiry and strike-selection rules. Use `--useCache=true` to enable cache,
 `--useCache=false` (or `--no-cache`) to fetch candles directly without reading or
 writing cache, or `--refresh-cache` to fetch and replace cached candles. The
 command writes an auditable trade CSV and summary under `Backtest Outputs/`.
