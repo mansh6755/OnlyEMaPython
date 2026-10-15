@@ -23,11 +23,19 @@ the shared EMA signal logic on complete NIFTY five-minute candles, then uses
 historical candles for the selected Fyers option contract to estimate the
 paper-run quote without looking beyond the simulated action time. Entry/EMA11
 exit actions use the quote at the simulated decision poll, and daily loss is
-checked on each poll. The default poll interval, lots, and
-daily loss limit come from `EMA_POLL_SECONDS`, `EMA_LOTS`, and `EMA_MAX_LOSS`.
+checked on each poll. The `EMA_MAX_LOSS` threshold (default ₹5,500) is per
+trading day and includes realized P&L plus the open position's estimated P&L;
+once reached, the open trade exits and further entries are blocked for that day.
+Since checks use the simulated poll schedule and completed option candles, a
+loss can cross the threshold between checks. The default poll interval and lots
+come from `EMA_POLL_SECONDS` and `EMA_LOTS`.
 Option candle resolution defaults to `auto` (`5S` for recent history, otherwise
 `1` minute); quote fills are therefore approximations, not guaranteed live fills.
-The command writes an auditable trade CSV and summary under `Backtest Outputs/`.
+Historical candles are cached persistently under `Backtest Outputs/.fyers_cache/`
+by default (`EMA_REPLAY_USE_CACHE=true`). Use `--useCache=true` to enable cache,
+`--useCache=false` (or `--no-cache`) to fetch candles directly without reading or
+writing cache, or `--refresh-cache` to fetch and replace cached candles. The
+command writes an auditable trade CSV and summary under `Backtest Outputs/`.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.

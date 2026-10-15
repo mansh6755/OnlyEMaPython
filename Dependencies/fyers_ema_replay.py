@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
+import json
 import math
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -41,6 +44,8 @@ SQUARE_OFF = time(15, 15)
 MAX_ENTRY_BAR_AGE = timedelta(minutes=2)
 HISTORY_CHUNK_DAYS = 90
 OPTION_RESOLUTION_SECONDS = {"5S": 5, "1": 60}
+HISTORY_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+CACHE_VERSION = 1
 
 
 @dataclass(slots=True)
@@ -93,11 +98,156 @@ def _history_chunks(start: date, end: date) -> list[tuple[date, date]]:
     return chunks
 
 
-def _fetch_index_history(api: FyersAPI, start: date, end: date) -> pd.DataFrame:
-    frames = [
-        api.history(UNDERLYING_SYMBOL, resolution="1", start=left, end=right)
-        for left, right in _history_chunks(start, end)
-    ]
+def _expiry_lookup_end(end: date, today: date) -> date:
+    """Include next-week expiries needed by signals near the end of the replay."""
+    return min(end + timedelta(days=7), today - timedelta(days=1))
+
+
+def _parse_cache_flag(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("useCache must be true or false.")
+
+
+class FyersHistoryCache:
+    """Persistent cache of immutable historical candle requests."""
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        *,
+        enabled: bool = True,
+        refresh: bool = False,
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.enabled = enabled
+        self.refresh = refresh
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _key(
+        symbol: str,
+        resolution: str,
+        start: date,
+        end: date,
+        expired: bool,
+    ) -> str:
+        identity = json.dumps(
+            {
+                "version": CACHE_VERSION,
+                "symbol": symbol,
+                "resolution": resolution,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "expired": expired,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def history(
+        self,
+        api: FyersAPI,
+        symbol: str,
+        *,
+        resolution: str,
+        start: date,
+        end: date,
+        expired: bool = False,
+    ) -> pd.DataFrame:
+        if not self.enabled:
+            self.misses += 1
+            return api.history(
+                symbol,
+                resolution=resolution,
+                start=start,
+                end=end,
+                expired=expired,
+            )
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self.cache_dir / f"{self._key(symbol, resolution, start, end, expired)}.csv"
+        if path.is_file() and not self.refresh:
+            try:
+                cached = pd.read_csv(path)
+                if list(cached.columns) != HISTORY_COLUMNS:
+                    raise ValueError("unexpected cached candle columns")
+                if not cached.empty:
+                    cached["timestamp"] = pd.to_datetime(cached["timestamp"], utc=True).dt.tz_convert(IST)
+                    for column in HISTORY_COLUMNS[1:]:
+                        cached[column] = pd.to_numeric(cached[column], errors="raise")
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                raise RuntimeError(f"Unable to read Fyers history cache {path}. Clear that cache file.") from exc
+            self.hits += 1
+            return cached[HISTORY_COLUMNS]
+
+        self.misses += 1
+        history = api.history(
+            symbol,
+            resolution=resolution,
+            start=start,
+            end=end,
+            expired=expired,
+        )
+        if list(history.columns) != HISTORY_COLUMNS:
+            raise ValueError("Fyers history returned an unexpected candle schema; cache was not written.")
+        history = self._normalize(history)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=self.cache_dir,
+                prefix=f".{path.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+            history.to_csv(temporary_path, index=False)
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return history.copy()
+
+    @staticmethod
+    def _normalize(history: pd.DataFrame) -> pd.DataFrame:
+        normalized = history[HISTORY_COLUMNS].copy()
+        if not normalized.empty:
+            timestamps = pd.to_datetime(normalized["timestamp"], errors="raise")
+            timestamps = timestamps.dt.tz_localize(IST) if timestamps.dt.tz is None else timestamps.dt.tz_convert(IST)
+            normalized["timestamp"] = timestamps
+            for column in HISTORY_COLUMNS[1:]:
+                normalized[column] = pd.to_numeric(normalized[column], errors="raise")
+        return normalized
+
+
+def _fetch_index_history(
+    api: FyersAPI,
+    start: date,
+    end: date,
+    history_cache: FyersHistoryCache | None = None,
+) -> pd.DataFrame:
+    frames = []
+    for left, right in _history_chunks(start, end):
+        if history_cache is None:
+            frame = api.history(UNDERLYING_SYMBOL, resolution="1", start=left, end=right)
+        else:
+            frame = history_cache.history(
+                api,
+                UNDERLYING_SYMBOL,
+                resolution="1",
+                start=left,
+                end=right,
+            )
+        frames.append(frame)
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -240,6 +390,7 @@ def replay(
     max_daily_loss: float = 5500.0,
     poll_seconds: int = 30,
     option_resolution: str = "5S",
+    history_cache: FyersHistoryCache | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if poll_seconds <= 0 or poll_seconds > 120:
         raise ValueError("poll_seconds must be between 1 and 120.")
@@ -281,12 +432,24 @@ def replay(
     def option_day(contract: FyersOptionContract, day: date) -> _OptionQuotes:
         key = (contract.symbol, day)
         if key not in option_cache:
-            history = api.history(
-                contract.symbol,
-                resolution=option_resolution,
-                start=day,
-                end=day,
-                expired=contract.expiry < date.today(),
+            expired = contract.expiry < date.today()
+            history = (
+                history_cache.history(
+                    api,
+                    contract.symbol,
+                    resolution=option_resolution,
+                    start=day,
+                    end=day,
+                    expired=expired,
+                )
+                if history_cache is not None
+                else api.history(
+                    contract.symbol,
+                    resolution=option_resolution,
+                    start=day,
+                    end=day,
+                    expired=expired,
+                )
             )
             option_cache[key] = _prepare_option_quotes(history, option_resolution)
         return option_cache[key]
@@ -462,6 +625,7 @@ def _report(
     end: date,
     option_resolution: str,
     poll_seconds: int,
+    history_cache: FyersHistoryCache,
 ) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = f"fyers_ema_replay_{start:%Y%m%d}_{end:%Y%m%d}"
@@ -485,6 +649,8 @@ def _report(
         "daily loss is checked on each poll. Quotes use the last completed option candle and are "
         "not guaranteed live fills.",
         f"Option candle resolution: {option_resolution}; simulated poll interval: {poll_seconds}s.",
+        f"Historical candle cache: {'enabled' if history_cache.enabled else 'disabled'}; "
+        f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner.",
         "P&L is gross, matching the live alert calculation; fees and slippage are not included.",
         "Archived contracts use the current Fyers lot size because historical lot-size metadata "
@@ -516,6 +682,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-daily-loss", type=float, default=None)
     parser.add_argument("--poll-seconds", type=int, default=None)
     parser.add_argument("--option-resolution", choices=("auto", "5S", "1"), default="auto")
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument(
+        "--useCache",
+        "--use-cache",
+        dest="use_cache",
+        type=_parse_cache_flag,
+        default=None,
+        metavar="{true,false}",
+        help="Read/write historical candle cache (default: EMA_REPLAY_USE_CACHE or true).",
+    )
+    cache_group.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Fetch all historical candles directly from Fyers; do not read or write the local cache.",
+    )
+    cache_group.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Fetch candles from Fyers and replace matching cache entries.",
+    )
     args = parser.parse_args(argv)
     try:
         start, end = date.fromisoformat(args.start_date), date.fromisoformat(args.end_date)
@@ -525,6 +711,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("date range must be ordered and lots must be positive")
 
     load_dotenv(ENV_FILE, override=False)
+    if args.use_cache is None:
+        try:
+            use_cache = _parse_cache_flag(os.getenv("EMA_REPLAY_USE_CACHE", "true"))
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"Invalid EMA_REPLAY_USE_CACHE: {exc}")
+    else:
+        use_cache = args.use_cache
+    if args.no_cache:
+        use_cache = False
     app_id = os.getenv("FYERS_APP_ID", "").strip()
     token_file_value = os.getenv("FYERS_TOKEN_FILE", "").strip()
     token_file = (
@@ -558,7 +753,7 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(IST)
     if end > now.date() or (end == now.date() and now.timetz().replace(tzinfo=None) < SQUARE_OFF):
         parser.error("end-date must be a completed trading date; today's replay is available after 15:15 IST.")
-    query_end = min(end, date.today() - timedelta(days=1))
+    query_end = _expiry_lookup_end(end, date.today())
     logic = _load_signal_logic()
     config = logic.EMATrendConfig(
         ema_fast_period=4,
@@ -573,8 +768,13 @@ def main(argv: list[str] | None = None) -> int:
         ema18_slope_atr_multiplier=0.2,
     )
     api = FyersAPI(app_id, access_token)
+    history_cache = FyersHistoryCache(
+        OUTPUT_DIR / ".fyers_cache",
+        enabled=use_cache,
+        refresh=args.refresh_cache,
+    )
     try:
-        raw_index = _fetch_index_history(api, start - timedelta(days=7), end)
+        raw_index = _fetch_index_history(api, start - timedelta(days=7), end, history_cache)
         if raw_index.empty:
             raise RuntimeError("Fyers returned no index candles for the selected period.")
         end_of_range = datetime.combine(end + timedelta(days=1), time.min, tzinfo=IST)
@@ -603,10 +803,11 @@ def main(argv: list[str] | None = None) -> int:
             max_daily_loss=max_daily_loss,
             poll_seconds=poll_seconds,
             option_resolution=option_resolution,
+            history_cache=history_cache,
         )
     except (FyersAPIError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
-    _report(trades, counters, start, end, option_resolution, poll_seconds)
+    _report(trades, counters, start, end, option_resolution, poll_seconds, history_cache)
     return 0
 
 

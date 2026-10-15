@@ -1,8 +1,17 @@
-from datetime import date
+import argparse
+from datetime import date, time
 
 import pandas as pd
+import pytest
 
-from Dependencies.fyers_ema_replay import _action_polls, _quote_at, replay
+from Dependencies.fyers_ema_replay import (
+    FyersHistoryCache,
+    _action_polls,
+    _expiry_lookup_end,
+    _parse_cache_flag,
+    _quote_at,
+    replay,
+)
 
 
 class _FakeAPI:
@@ -70,6 +79,154 @@ def test_poll_schedule_includes_the_first_poll_after_square_off():
     assert polls[-1] < pd.Timestamp("2026-10-15T15:16:00+05:30")
 
 
+def test_expiry_lookup_includes_the_following_week_after_the_replay_end():
+    assert _expiry_lookup_end(date(2026, 2, 28), date(2026, 10, 15)) == date(2026, 3, 7)
+    assert _expiry_lookup_end(date(2026, 10, 15), date(2026, 10, 15)) == date(2026, 10, 14)
+
+
+def test_use_cache_flag_accepts_true_or_false_values():
+    assert _parse_cache_flag("true") is True
+    assert _parse_cache_flag("FALSE") is False
+    with pytest.raises(argparse.ArgumentTypeError, match="useCache must be true or false"):
+        _parse_cache_flag("yes")
+
+
+def test_history_cache_reuses_candles_across_backtest_runs(tmp_path):
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-10-15T09:15:00+05:30"]),
+            "open": [100.0],
+            "high": [105.0],
+            "low": [99.0],
+            "close": [104.0],
+            "volume": [10.0],
+        }
+    )
+    api = _FakeAPI(bars)
+    cache = FyersHistoryCache(tmp_path)
+    request = {
+        "resolution": "1",
+        "start": date(2026, 10, 15),
+        "end": date(2026, 10, 15),
+    }
+
+    first = cache.history(api, "NSE:NIFTY50-INDEX", **request)
+    second = cache.history(api, "NSE:NIFTY50-INDEX", **request)
+
+    assert len(api.requests) == 1
+    assert cache.hits == 1
+    assert cache.misses == 1
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_history_cache_separates_expired_and_active_history(tmp_path):
+    bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    api = _FakeAPI(bars)
+    cache = FyersHistoryCache(tmp_path)
+    request = {
+        "resolution": "1",
+        "start": date(2026, 10, 15),
+        "end": date(2026, 10, 15),
+    }
+
+    cache.history(api, "NSE:NIFTY26O1922750CE", expired=False, **request)
+    cache.history(api, "NSE:NIFTY26O1922750CE", expired=True, **request)
+    cache.history(api, "NSE:NIFTY26O1922750CE", expired=True, **request)
+
+    assert len(api.requests) == 2
+    assert cache.hits == 1
+    assert cache.misses == 2
+
+
+def test_history_cache_key_includes_symbol_resolution_and_date_range(tmp_path):
+    bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    api = _FakeAPI(bars)
+    cache = FyersHistoryCache(tmp_path)
+    start = date(2026, 10, 15)
+    end = date(2026, 10, 16)
+
+    cache.history(api, "NSE:NIFTY50-INDEX", resolution="1", start=start, end=end)
+    cache.history(api, "NSE:NIFTY50-INDEX", resolution="5S", start=start, end=end)
+    cache.history(api, "NSE:NIFTY26O1922750CE", resolution="1", start=start, end=end)
+    cache.history(api, "NSE:NIFTY50-INDEX", resolution="1", start=start, end=start)
+
+    assert len(api.requests) == 4
+    assert cache.hits == 0
+    assert cache.misses == 4
+
+
+def test_history_cache_can_be_disabled_without_creating_cache_files(tmp_path):
+    bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    api = _FakeAPI(bars)
+    cache = FyersHistoryCache(tmp_path, enabled=False)
+    request = {
+        "resolution": "1",
+        "start": date(2026, 10, 15),
+        "end": date(2026, 10, 15),
+    }
+
+    cache.history(api, "NSE:NIFTY50-INDEX", **request)
+    cache.history(api, "NSE:NIFTY50-INDEX", **request)
+
+    assert len(api.requests) == 2
+    assert cache.misses == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_history_cache_reports_corrupt_files_instead_of_silently_refetching(tmp_path):
+    api = _FakeAPI(pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]))
+    cache = FyersHistoryCache(tmp_path)
+    request = {
+        "resolution": "1",
+        "start": date(2026, 10, 15),
+        "end": date(2026, 10, 15),
+    }
+    cache.history(api, "NSE:NIFTY50-INDEX", **request)
+    path = next(tmp_path.glob("*.csv"))
+    path.write_text("not,a,candle,file\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Clear that cache file"):
+        cache.history(api, "NSE:NIFTY50-INDEX", **request)
+    assert len(api.requests) == 1
+
+
+def test_history_cache_refresh_replaces_cached_candles(tmp_path):
+    class ChangingAPI(_FakeAPI):
+        def history(self, symbol, **kwargs):
+            self.requests.append((symbol, kwargs))
+            close = 100.0 + len(self.requests)
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(["2026-10-15T09:15:00+05:30"]),
+                    "open": [close],
+                    "high": [close],
+                    "low": [close],
+                    "close": [close],
+                    "volume": [1.0],
+                }
+            )
+
+    api = ChangingAPI(pd.DataFrame())
+    cache_dir = tmp_path
+    request = {
+        "resolution": "1",
+        "start": date(2026, 10, 15),
+        "end": date(2026, 10, 15),
+    }
+
+    FyersHistoryCache(cache_dir).history(api, "NSE:NIFTY50-INDEX", **request)
+    refreshed = FyersHistoryCache(cache_dir, refresh=True).history(
+        api,
+        "NSE:NIFTY50-INDEX",
+        **request,
+    )
+    cached = FyersHistoryCache(cache_dir).history(api, "NSE:NIFTY50-INDEX", **request)
+
+    assert len(api.requests) == 2
+    assert refreshed.iloc[0]["close"] == 102.0
+    assert cached.iloc[0]["close"] == 102.0
+
+
 def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     day = date(2026, 10, 15)
     timestamps = pd.date_range(
@@ -133,3 +290,84 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     assert trades.iloc[0]["gross_pnl"] == 650.0
     assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
     assert api.requests[0][0] == "NSE:NIFTY26O2022500CE"
+
+
+def test_daily_max_loss_exits_position_and_resets_for_the_next_day():
+    class DailyEntryLogic(_FakeLogic):
+        class EMATrendSignalEngine:
+            def __init__(self, _config):
+                pass
+
+            def evaluate_candle(self, candles, position=None):
+                timestamp = pd.Timestamp(candles.iloc[-1]["timestamp"])
+                if position is None and timestamp.time() in {time(9, 25), time(9, 35)}:
+                    return _FakeLogic.EMATrendDecision("ENTER_LONG", signal_triggered=True)
+                return _FakeLogic.EMATrendDecision()
+
+    days = [date(2026, 10, 15), date(2026, 10, 16)]
+    index_timestamps = [
+        pd.Timestamp(f"{day.isoformat()}T{clock}+05:30")
+        for day in days
+        for clock in ("09:25:00", "09:30:00", "09:35:00")
+    ]
+    index_bars = pd.DataFrame(
+        {
+            "timestamp": index_timestamps,
+            "open": [22500.0] * len(index_timestamps),
+            "high": [22520.0] * len(index_timestamps),
+            "low": [22490.0] * len(index_timestamps),
+            "close": [22510.0] * len(index_timestamps),
+            "volume": [5] * len(index_timestamps),
+        }
+    )
+    option_timestamps = pd.DatetimeIndex(
+        [
+            stamp
+            for day in days
+            for stamp in pd.date_range(
+                pd.Timestamp(f"{day.isoformat()}T09:15:00+05:30"),
+                pd.Timestamp(f"{day.isoformat()}T15:15:00+05:30"),
+                freq="5s",
+            )
+        ]
+    )
+    option_prices = [200.0 if stamp.time() < time(9, 30) else 115.0 for stamp in option_timestamps]
+    option_bars = pd.DataFrame(
+        {
+            "timestamp": option_timestamps,
+            "open": option_prices,
+            "high": option_prices,
+            "low": option_prices,
+            "close": option_prices,
+            "volume": 1,
+        }
+    )
+    api = _FakeAPI(option_bars)
+    active_rows = [
+        {
+            "underlying": "NIFTY",
+            "symbol": "NSE:NIFTY26O2022500CE",
+            "expiry": date(2026, 10, 20),
+            "strike_price": 22500.0,
+            "option_type": "CE",
+            "lot_size": 65,
+        }
+    ]
+
+    trades, counters = replay(
+        signal_logic=DailyEntryLogic,
+        strategy_config=None,
+        index_bars=index_bars,
+        api=api,
+        active_rows=active_rows,
+        expiries=[date(2026, 10, 20)],
+        start=days[0],
+        end=days[1],
+        max_daily_loss=5500.0,
+        poll_seconds=30,
+    )
+
+    assert counters == {"signals": 4, "entries": 2, "exits": 2, "daily_loss_halts": 2}
+    assert trades["exit_reason"].tolist() == ["DAILY_MAX_LOSS", "DAILY_MAX_LOSS"]
+    assert trades["gross_pnl"].tolist() == [-5525.0, -5525.0]
+    assert trades["entry_time"].str[:10].tolist() == ["2026-10-15", "2026-10-16"]
