@@ -31,6 +31,7 @@ from Dependencies.fyers_options import (  # noqa: E402
     _parse_expiry,
     select_atm_option,
     select_nearest_expiry,
+    select_next_week_expiry,
     select_parent_style_expiry,
 )
 from Dependencies.fyers_telegram_auth import load_persisted_access_token  # noqa: E402
@@ -127,6 +128,21 @@ def _parse_cache_flag(value: str) -> bool:
     if normalized == "false":
         return False
     raise argparse.ArgumentTypeError("useCache must be true or false.")
+
+
+def _parse_boolean_flag(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("use true or false.")
+
+
+def _replay_poll_seconds(parent_logic: bool, override: int | None) -> int:
+    if override is not None:
+        return override
+    return 2 if parent_logic else 30
 
 
 class FyersHistoryCache:
@@ -331,13 +347,15 @@ def _resolve_contract(
     fallback_lot_size: int,
     underlying: str = "NIFTY",
     underlying_symbol: str = UNDERLYING_SYMBOL,
-    strike_step: float = 50,
+    strike_step: float | None = 50,
     expiry_policy: str = "second",
 ) -> FyersOptionContract:
     if expiry_policy == "nearest":
         expiry = select_nearest_expiry(expiries, today=trade_date)
     elif expiry_policy == "second":
         expiry = select_parent_style_expiry(expiries, today=trade_date)
+    elif expiry_policy == "next_week":
+        expiry = select_next_week_expiry(expiries, today=trade_date)
     else:
         raise ValueError(f"Unsupported replay expiry policy: {expiry_policy!r}")
     if expiry < date.today():
@@ -352,7 +370,13 @@ def _resolve_contract(
             and row.get("option_type") in {"CE", "PE"}
             and _active_expiry(row) == expiry
         ]
-    return select_atm_option(rows, action=action, spot=spot, expiry=expiry, strike_step=strike_step)
+    return select_atm_option(
+        rows,
+        action=action,
+        spot=spot,
+        expiry=expiry,
+        strike_step=strike_step,
+    )
 
 
 def _quote_at(
@@ -426,7 +450,7 @@ def replay(
     history_cache: FyersHistoryCache | None = None,
     underlying: str = "NIFTY",
     underlying_symbol: str = UNDERLYING_SYMBOL,
-    strike_step: float = 50,
+    strike_step: float | None = 50,
     expiry_policy: str = "second",
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if poll_seconds <= 0 or poll_seconds > 120:
@@ -669,10 +693,13 @@ def _report(
     history_cache: FyersHistoryCache,
     underlying: str = "NIFTY",
     expiry_policy: str = "second",
-    strike_step: float = 50,
+    strike_step: float | None = 50,
+    parent_logic: bool = True,
 ) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     suffix = f"_{underlying.lower()}" if underlying != "NIFTY" else ""
+    if not parent_logic:
+        suffix += "_no_parent"
     stem = f"fyers_ema_replay{suffix}_{start:%Y%m%d}_{end:%Y%m%d}"
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
@@ -697,8 +724,13 @@ def _report(
         f"Historical candle cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner. "
+        f"Parent logic: {str(parent_logic).lower()}. "
         f"Option expiry policy: {expiry_policy} listed expiry on/after the trade date; "
-        f"spot is rounded to the nearest {strike_step:g}-point strike before choosing the closest listed strike.",
+        + (
+            f"spot is rounded to the nearest {strike_step:g}-point strike before choosing the closest listed strike."
+            if strike_step is not None
+            else "the closest listed strike to the unrounded spot is selected."
+        ),
         "P&L is gross, matching the live alert calculation; fees and slippage are not included.",
         "Archived contracts use the current Fyers lot size because historical lot-size metadata "
         "is not supplied by the expired-symbol endpoint.",
@@ -728,6 +760,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=tuple(UNDERLYING_CONFIGS),
         default="nifty",
         help="Index and option market to replay (default: nifty).",
+    )
+    parser.add_argument(
+        "--parent-logic",
+        type=_parse_boolean_flag,
+        choices=(True, False),
+        default=True,
+        metavar="{true,false}",
+        help="Apply parent-style expiry, strike rounding, polling, and complete-bar rules (default: true).",
     )
     parser.add_argument("--start-date", required=True, help="Inclusive YYYY-MM-DD date.")
     parser.add_argument("--end-date", required=True, help="Inclusive YYYY-MM-DD date.")
@@ -789,7 +829,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         lots = args.lots if args.lots is not None else int(os.getenv("EMA_LOTS", "1"))
-        poll_seconds = args.poll_seconds if args.poll_seconds is not None else int(os.getenv("EMA_POLL_SECONDS", "2"))
+        poll_seconds = _replay_poll_seconds(args.parent_logic, args.poll_seconds)
         max_daily_loss = (
             args.max_daily_loss if args.max_daily_loss is not None else float(os.getenv("EMA_MAX_LOSS", "5500"))
         )
@@ -797,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"Invalid EMA replay configuration: {exc}")
     if lots <= 0 or poll_seconds <= 0 or not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
         parser.error("lots, poll-seconds, and max-daily-loss must be positive; loss must be finite.")
-    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_NEXT").strip().upper() != "NEXT_NEXT":
+    if args.parent_logic and os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_NEXT").strip().upper() != "NEXT_NEXT":
         parser.error("This replay supports EMA_OPTION_EXPIRY_POLICY=NEXT_NEXT only.")
     if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
         parser.error("This replay supports EMA_OPTION_STRIKE_POLICY=ATM only.")
@@ -840,7 +880,11 @@ def main(argv: list[str] | None = None) -> int:
         if raw_index.empty:
             raise RuntimeError("Fyers returned no index candles for the selected period.")
         end_of_range = datetime.combine(end + timedelta(days=1), time.min, tzinfo=IST)
-        index_bars = completed_five_minute_bars(raw_index, end_of_range)
+        index_bars = completed_five_minute_bars(
+            raw_index,
+            end_of_range,
+            require_contiguous_minutes=args.parent_logic,
+        )
         active_rows = api.option_master(exchange=instrument["exchange"])
         active_expiries = {
             expiry
@@ -868,8 +912,8 @@ def main(argv: list[str] | None = None) -> int:
             history_cache=history_cache,
             underlying=underlying,
             underlying_symbol=underlying_symbol,
-            strike_step=instrument["strike_step"],
-            expiry_policy=instrument["expiry_policy"],
+            strike_step=instrument["strike_step"] if args.parent_logic else None,
+            expiry_policy=instrument["expiry_policy"] if args.parent_logic else "next_week",
         )
     except (FyersAPIError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
@@ -882,8 +926,9 @@ def main(argv: list[str] | None = None) -> int:
         poll_seconds,
         history_cache,
         underlying,
-        instrument["expiry_policy"],
-        instrument["strike_step"],
+        instrument["expiry_policy"] if args.parent_logic else "next_week",
+        instrument["strike_step"] if args.parent_logic else None,
+        args.parent_logic,
     )
     return 0
 

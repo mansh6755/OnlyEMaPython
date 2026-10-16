@@ -80,6 +80,32 @@ def test_completed_five_minute_bars_rejects_five_rows_not_aligned_to_exact_minut
     assert result.empty
 
 
+def test_completed_five_minute_bars_can_use_legacy_count_only_validation():
+    timestamps = pd.date_range("2026-10-09 09:15", periods=5, freq="min", tz=IST)
+    timestamps = timestamps.to_list()
+    timestamps[-1] += pd.Timedelta(seconds=1)
+    minute_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100, 101, 102, 103, 104],
+            "high": [101, 102, 103, 104, 105],
+            "low": [99, 100, 101, 102, 103],
+            "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "volume": [10, 11, 12, 13, 14],
+        }
+    )
+
+    result = completed_five_minute_bars(
+        minute_bars,
+        datetime(2026, 10, 9, 9, 22, tzinfo=IST),
+        require_contiguous_minutes=False,
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["timestamp"] == pd.Timestamp("2026-10-09 09:15", tz=IST)
+    assert result.iloc[0]["close"] == 104.5
+
+
 def test_daily_loss_limit_includes_unrealized_option_loss():
     assert daily_loss_limit_reached(
         realized_pnl=-1000,

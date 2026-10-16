@@ -12,7 +12,12 @@ from Dependencies.market_data_health import complete_minute_bucket_mask
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
+def completed_five_minute_bars(
+    minute_bars: pd.DataFrame,
+    now: datetime,
+    *,
+    require_contiguous_minutes: bool = True,
+) -> pd.DataFrame:
     """Aggregate only complete five-minute buckets containing all five minutes."""
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(minute_bars.columns):
@@ -30,8 +35,9 @@ def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.D
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     completed_before = pd.Timestamp(now.astimezone(IST)).floor("5min")
     frame = frame[frame.index < completed_before]
-    complete = complete_minute_bucket_mask(pd.DatetimeIndex(frame.index), 5)
-    frame = frame.loc[complete.to_numpy()]
+    if require_contiguous_minutes:
+        complete = complete_minute_bucket_mask(pd.DatetimeIndex(frame.index), 5)
+        frame = frame.loc[complete.to_numpy()]
     bars = frame.resample("5min", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )

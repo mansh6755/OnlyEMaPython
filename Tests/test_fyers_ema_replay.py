@@ -9,8 +9,12 @@ from Dependencies.fyers_ema_replay import (
     _action_polls,
     _archived_option_rows,
     _expiry_lookup_end,
+    _parse_boolean_flag,
     _parse_cache_flag,
     _quote_at,
+    _report,
+    _replay_poll_seconds,
+    _resolve_contract,
     replay,
 )
 
@@ -116,6 +120,90 @@ def test_use_cache_flag_accepts_true_or_false_values():
     assert _parse_cache_flag("FALSE") is False
     with pytest.raises(argparse.ArgumentTypeError, match="useCache must be true or false"):
         _parse_cache_flag("yes")
+
+
+def test_parent_logic_flag_accepts_true_or_false_values():
+    assert _parse_boolean_flag("true") is True
+    assert _parse_boolean_flag("FALSE") is False
+    with pytest.raises(argparse.ArgumentTypeError, match="use true or false"):
+        _parse_boolean_flag("yes")
+
+
+@pytest.mark.parametrize(
+    ("parent_logic", "override", "expected"),
+    [(True, None, 2), (False, None, 30), (True, 15, 15), (False, 15, 15)],
+)
+def test_replay_poll_interval_uses_mode_default_unless_explicitly_overridden(parent_logic, override, expected):
+    assert _replay_poll_seconds(parent_logic, override) == expected
+
+
+def test_legacy_contract_selection_uses_next_week_and_unrounded_spot():
+    expiries = [date(2027, 1, 19), date(2027, 1, 12)]
+    active_rows = [
+        {
+            "underlying": "NIFTY",
+            "symbol": f"NSE:NIFTY-{expiry.isoformat()}-{strike}-CE",
+            "expiry": expiry,
+            "strike_price": strike,
+            "option_type": "CE",
+            "lot_size": 65,
+        }
+        for expiry in expiries
+        for strike in (82500, 82600)
+    ]
+
+    contract = _resolve_contract(
+        object(),
+        action="ENTER_LONG",
+        spot=82551,
+        trade_date=date(2027, 1, 4),
+        active_rows=active_rows,
+        expiries=expiries,
+        archived_symbols={},
+        fallback_lot_size=65,
+        expiry_policy="next_week",
+        strike_step=None,
+    )
+
+    assert contract.expiry == date(2027, 1, 12)
+    assert contract.strike == 82600
+
+
+def test_report_records_parent_logic_and_keeps_modes_in_separate_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("Dependencies.fyers_ema_replay.OUTPUT_DIR", tmp_path)
+    counters = {"signals": 0, "entries": 0, "exits": 0, "daily_loss_halts": 0}
+    parent_paths = _report(
+        pd.DataFrame(),
+        counters,
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+        "1",
+        2,
+        FyersHistoryCache(tmp_path / "cache"),
+        "SENSEX",
+        "nearest",
+        100,
+        True,
+    )
+    legacy_paths = _report(
+        pd.DataFrame(),
+        counters,
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+        "1",
+        30,
+        FyersHistoryCache(tmp_path / "cache"),
+        "SENSEX",
+        "next_week",
+        None,
+        False,
+    )
+
+    assert parent_paths[0].name == "fyers_ema_replay_sensex_20260101_20260131_trades.csv"
+    assert legacy_paths[0].name == "fyers_ema_replay_sensex_no_parent_20260101_20260131_trades.csv"
+    assert "Parent logic: true." in parent_paths[1].read_text()
+    assert "Parent logic: false." in legacy_paths[1].read_text()
+    assert "unrounded spot" in legacy_paths[1].read_text()
 
 
 def test_history_cache_reuses_candles_across_backtest_runs(tmp_path):

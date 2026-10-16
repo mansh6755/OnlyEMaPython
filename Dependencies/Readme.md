@@ -41,6 +41,19 @@ EMA expiry and strike-selection rules. Use `--useCache=true` to enable cache,
 `--useCache=false` (or `--no-cache`) to fetch candles directly without reading or
 writing cache, or `--refresh-cache` to fetch and replace cached candles. The
 command writes an auditable trade CSV and summary under `Backtest Outputs/`.
+`--parent-logic true` (the default) enables the parent-style poll interval and
+complete-bar, expiry, and strike-selection rules. Use `--parent-logic false` to
+run with the earlier Fyers replay rules: 30-second polling, count-only complete
+five-minute buckets, next-ISO-week expiry, and ATM strike selection from the
+unrounded spot. Both modes can be compared without overwriting reports; the
+non-parent report filenames include `_no_parent`. An explicit `--poll-seconds`
+overrides the selected mode's default polling interval.
+Run either mode from the repository root; add `--underlying sensex` for SENSEX:
+```
+python algo.py fyers-backtest --start-date 2026-01-01 --end-date 2026-10-16 --parent-logic true
+python algo.py fyers-backtest --start-date 2026-01-01 --end-date 2026-10-16 --parent-logic false
+python algo.py fyers-backtest --underlying sensex --start-date 2026-01-01 --end-date 2026-10-16 --parent-logic true
+```
 Pass `--underlying sensex` to replay BSE SENSEX index and option data; the default
 remains NIFTY. SENSEX uses the BSE derivatives master and 100-point ATM strike
 steps, selects the nearest listed expiry (the second-upcoming contract has
