@@ -20,9 +20,11 @@ from Dependencies.fyers_ema_runner import (
     _format_error_alert,
     _format_exit_alert,
     _format_health_alert,
+    _format_intrabar_shadow_alert,
     _format_pnl,
     _format_strategy_started_alert,
     completed_five_minute_bars,
+    current_partial_five_minute_bar,
     daily_loss_limit_reached,
 )
 from Dependencies.fyers_options import FyersOptionContract
@@ -55,6 +57,98 @@ def test_completed_five_minute_bars_aggregates_only_closed_full_bars():
     assert result.iloc[0]["low"] == 99
     assert result.iloc[0]["close"] == 104.5
     assert result.iloc[0]["volume"] == 60
+
+
+def test_current_partial_five_minute_bar_aggregates_fresh_complete_minute_snapshots():
+    timestamps = pd.date_range("2026-10-09 09:30", periods=3, freq="min", tz=IST)
+    minute_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100, 101, 102],
+            "high": [102, 103, 104],
+            "low": [99, 100, 101],
+            "close": [101, 102, 103],
+            "volume": [10, 11, 12],
+        }
+    )
+
+    result = current_partial_five_minute_bar(
+        minute_bars,
+        datetime(2026, 10, 9, 9, 32, 30, tzinfo=IST),
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["timestamp"] == pd.Timestamp("2026-10-09 09:30", tz=IST)
+    assert result.iloc[0]["open"] == 100
+    assert result.iloc[0]["high"] == 104
+    assert result.iloc[0]["low"] == 99
+    assert result.iloc[0]["close"] == 103
+    assert result.iloc[0]["volume"] == 33
+
+
+def test_current_partial_five_minute_bar_rejects_missing_minute_updates():
+    timestamps = pd.DatetimeIndex(
+        [pd.Timestamp("2026-10-09 09:30", tz=IST), pd.Timestamp("2026-10-09 09:32", tz=IST)]
+    )
+    minute_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100, 102],
+            "high": [102, 104],
+            "low": [99, 101],
+            "close": [101, 103],
+            "volume": [10, 12],
+        }
+    )
+
+    gap = current_partial_five_minute_bar(
+        minute_bars,
+        datetime(2026, 10, 9, 9, 32, 30, tzinfo=IST),
+    )
+    stale = current_partial_five_minute_bar(
+        minute_bars.iloc[:1],
+        datetime(2026, 10, 9, 9, 33, tzinfo=IST),
+    )
+
+    assert gap.empty
+    assert stale.empty
+
+
+def test_current_partial_five_minute_bar_accepts_latest_completed_minute():
+    timestamps = pd.date_range("2026-10-09 09:30", periods=2, freq="min", tz=IST)
+    minute_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100, 101],
+            "high": [102, 103],
+            "low": [99, 100],
+            "close": [101, 102],
+            "volume": [10, 11],
+        }
+    )
+
+    result = current_partial_five_minute_bar(
+        minute_bars,
+        datetime(2026, 10, 9, 9, 32, 30, tzinfo=IST),
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["timestamp"] == pd.Timestamp("2026-10-09 09:30", tz=IST)
+    assert result.iloc[0]["close"] == 102
+
+
+def test_early_shadow_alert_identifies_provisional_signal_and_no_order():
+    alert = _format_intrabar_shadow_alert(
+        "ENTER_LONG",
+        24012.5,
+        datetime(2026, 10, 9, 9, 32, 30, tzinfo=IST),
+    )
+
+    assert "EARLY SIGNAL · EMA SHADOW (NO ORDER PLACED)" in alert
+    assert "Action: ENTER_LONG" in alert
+    assert "Underlying: 24012.50" in alert
+    assert "First observed: 2026-10-09 09:32:30 IST" in alert
+    assert "may not remain valid at candle close" in alert
 
 
 def test_daily_loss_limit_includes_unrealized_option_loss():

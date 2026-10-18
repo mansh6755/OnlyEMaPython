@@ -169,10 +169,11 @@ def _format_eod_alert(realized_pnl: float, trade_count: int, mode: str, at: date
     )
 
 
-def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
+def _prepare_minute_bars(minute_bars: pd.DataFrame) -> pd.DataFrame:
     required = {"timestamp", "open", "high", "low", "close", "volume"}
     if not required.issubset(minute_bars.columns):
         raise ValueError("Fyers minute data is missing required OHLCV columns.")
+
     frame = minute_bars.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
     if frame["timestamp"].dt.tz is None:
@@ -183,7 +184,11 @@ def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.D
     frame = frame[~frame.index.duplicated(keep="last")]
     for column in ("open", "high", "low", "close", "volume"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    return frame.dropna(subset=["open", "high", "low", "close"])
+
+
+def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
+    frame = _prepare_minute_bars(minute_bars)
     completed_before = pd.Timestamp(now.astimezone(IST)).floor("5min")
     frame = frame[frame.index < completed_before]
     bars = frame.resample("5min", label="left", closed="left").agg(
@@ -192,6 +197,33 @@ def completed_five_minute_bars(minute_bars: pd.DataFrame, now: datetime) -> pd.D
     counts = frame["close"].resample("5min", label="left", closed="left").count()
     bars = bars[(counts == 5) & bars["close"].notna()]
     return bars.reset_index(names="timestamp")
+
+
+def current_partial_five_minute_bar(minute_bars: pd.DataFrame, now: datetime) -> pd.DataFrame:
+    frame = _prepare_minute_bars(minute_bars)
+    current_time = pd.Timestamp(now)
+    current_time = current_time.tz_localize(IST) if current_time.tzinfo is None else current_time.tz_convert(IST)
+    bar_start = current_time.floor("5min")
+    current_minute = current_time.floor("min")
+    partial = frame.loc[(frame.index >= bar_start) & (frame.index <= current_minute)]
+    if partial.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    expected_minutes = pd.date_range(bar_start, partial.index[-1], freq="min")
+    if not partial.index.equals(expected_minutes) or current_time - partial.index[-1] > pd.Timedelta(minutes=2):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    return pd.DataFrame(
+        [
+            {
+                "timestamp": bar_start,
+                "open": partial["open"].iloc[0],
+                "high": partial["high"].max(),
+                "low": partial["low"].min(),
+                "close": partial["close"].iloc[-1],
+                "volume": partial["volume"].sum(),
+            }
+        ]
+    )
 
 
 def _format_error_alert(context: str, error: Exception, mode: str) -> str:
@@ -227,6 +259,16 @@ def _format_strategy_started_alert(mode: str, underlying_symbol: str, lots: int,
         f"Underlying: {underlying_symbol}\n"
         f"Lots: {lots}\n"
         f"Time: {at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+    )
+
+
+def _format_intrabar_shadow_alert(action: str, underlying: float, at: datetime) -> str:
+    return (
+        f"🔎 EARLY SIGNAL · EMA SHADOW (NO ORDER PLACED)\n"
+        f"Action: {action}\n"
+        f"Underlying: {underlying:.2f}\n"
+        f"First observed: {at.astimezone(IST):%Y-%m-%d %H:%M:%S} IST\n"
+        "This provisional signal may not remain valid at candle close."
     )
 
 
@@ -412,8 +454,9 @@ def _run_ema_runner(
 ) -> None:
     underlying_symbol = os.getenv("FYERS_UNDERLYING_SYMBOL", "NSE:NIFTY50-INDEX").strip()
     live_enabled = os.getenv("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+    early_shadow_enabled = os.getenv("EMA_EARLY_SIGNAL_SHADOW", "false").strip().lower() == "true"
     lots = _positive_int("EMA_LOTS", 1)
-    poll_seconds = _positive_int("EMA_POLL_SECONDS", 30)
+    poll_seconds = _positive_int("EMA_POLL_SECONDS", 5 if early_shadow_enabled else 30)
     max_daily_loss = float(os.getenv("EMA_MAX_LOSS", "5500"))
     if not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
         raise ValueError("EMA_MAX_LOSS must be finite and positive.")
@@ -438,6 +481,10 @@ def _run_ema_runner(
     completed_trades = 0
     active_date: date | None = None
     last_processed: pd.Timestamp | None = None
+    shadow_direction: str | None = None
+    shadow_entry_bar: pd.Timestamp | None = None
+    shadow_entry_action: str | None = None
+    shadow_last_signal_bar: pd.Timestamp | None = None
     startup_at = datetime.now(IST)
     next_health_at = startup_at + timedelta(hours=1)
     market_data_status = "WAITING FOR FIRST FETCH"
@@ -474,6 +521,11 @@ def _run_ema_runner(
     )
     LOGGER.info("EMA runner connected to Fyers; mode=%s; lots=%s", "LIVE" if live_enabled else "PAPER", lots)
     LOGGER.info("Option policy: next week's listed expiry, ATM, buy CE/PE by EMA direction.")
+    if early_shadow_enabled:
+        LOGGER.info(
+            "Early-signal shadow enabled; REST minute snapshots only, no shadow orders; poll=%ss",
+            poll_seconds,
+        )
 
     while True:
         now = datetime.now(IST)
@@ -500,6 +552,10 @@ def _run_ema_runner(
             realized_pnl = 0.0
             completed_trades = 0
             last_processed = None
+            shadow_direction = None
+            shadow_entry_bar = None
+            shadow_entry_action = None
+            shadow_last_signal_bar = None
             day_started_notified_date = None
             last_mark_price = None
             dashboard_state.update_account(
@@ -510,6 +566,22 @@ def _run_ema_runner(
                 daily_loss_limit=max_daily_loss,
             )
         if now.timetz().replace(tzinfo=None) >= day_time(15, 15):
+            if shadow_direction is not None:
+                shadow_action = "EXIT LONG" if shadow_direction == "LONG" else "EXIT SHORT"
+                notifier.notify(
+                    f"🔎 EARLY SIGNAL · EMA SHADOW (NO ORDER PLACED)\n"
+                    f"Action: {shadow_action}\n"
+                    "Reason: SQUARE_OFF\n"
+                    f"Time: {now.astimezone(IST):%Y-%m-%d %H:%M:%S} IST"
+                )
+                dashboard_state.record_event(
+                    {
+                        "at": now.isoformat(),
+                        "level": "SIGNAL",
+                        "message": f"Early shadow {shadow_action}: SQUARE_OFF",
+                    }
+                )
+                shadow_direction = None
             if position is not None:
                 try:
                     closed = _close_position(
@@ -607,6 +679,9 @@ def _run_ema_runner(
             day_time(9, 25) <= now.timetz().replace(tzinfo=None) < day_time(15, 15)
             and _entry_bar_is_fresh(current_timestamp, now)
         )
+        intrabar_entry_window = (
+            day_time(9, 25) <= now.timetz().replace(tzinfo=None) < day_time(15, 15)
+        )
         square_off_due = now.timetz().replace(tzinfo=None) >= day_time(15, 15)
         position_context = None
         if position is not None:
@@ -620,6 +695,87 @@ def _run_ema_runner(
             if current_timestamp != last_processed
             else signal_logic.EMATrendDecision()
         )
+        if early_shadow_enabled:
+            observed_at = last_market_data_at or now
+            partial_bar = current_partial_five_minute_bar(minute_bars, now)
+            if shadow_entry_bar is not None and shadow_entry_action is not None:
+                completed_entry_bar = strategy_frame.loc[
+                    strategy_frame["timestamp"] == shadow_entry_bar
+                ]
+                if not completed_entry_bar.empty:
+                    row = completed_entry_bar.iloc[-1]
+                    confirmed = bool(
+                        row["long_setup"]
+                        if shadow_entry_action == "ENTER_LONG"
+                        else row["short_setup"]
+                    )
+                    status = "CONFIRMED" if confirmed else "FADED"
+                    message = (
+                        f"Early {shadow_entry_action} signal {status} at 5-minute close "
+                        f"({shadow_entry_bar:%H:%M} IST)"
+                    )
+                    LOGGER.info("%s", message)
+                    dashboard_state.record_event(
+                        {"at": observed_at.isoformat(), "level": "SIGNAL", "message": message}
+                    )
+                    notifier.notify(f"🔎 EMA SHADOW · {status}\n{message}\nNo order was placed.")
+                    shadow_entry_bar = None
+                    shadow_entry_action = None
+
+            if not partial_bar.empty:
+                partial_timestamp = pd.Timestamp(partial_bar.iloc[-1]["timestamp"])
+                if shadow_direction is not None:
+                    live_underlying = float(partial_bar.iloc[-1]["close"])
+                    confirmed_ema11 = float(current["ema11"])
+                    exit_reason = ""
+                    if shadow_direction == "LONG" and float(partial_bar.iloc[-1]["low"]) < confirmed_ema11:
+                        exit_reason = "EARLY_EMA11_EXIT"
+                    elif shadow_direction == "SHORT" and float(partial_bar.iloc[-1]["high"]) > confirmed_ema11:
+                        exit_reason = "EARLY_EMA11_EXIT"
+                    if exit_reason:
+                        action = "EXIT LONG" if shadow_direction == "LONG" else "EXIT SHORT"
+                        notifier.notify(
+                            _format_intrabar_shadow_alert(action, live_underlying, observed_at)
+                            + f"\nReason: {exit_reason}; reference EMA11: {confirmed_ema11:.2f}"
+                        )
+                        dashboard_state.record_event(
+                            {
+                                "at": observed_at.isoformat(),
+                                "level": "SIGNAL",
+                                "message": f"Early shadow {action}: {exit_reason}",
+                            }
+                        )
+                        shadow_direction = None
+                        shadow_last_signal_bar = partial_timestamp
+                elif intrabar_entry_window and partial_timestamp != shadow_last_signal_bar:
+                    partial_frame = pd.concat([bars, partial_bar], ignore_index=True)
+                    intrabar_strategy_frame = signal_logic.build_ema_trend_with_indicators(
+                        partial_frame,
+                        strategy_config,
+                    )
+                    early_decision = signal_engine.evaluate_candle(intrabar_strategy_frame)
+                    if early_decision.action in {"ENTER_LONG", "ENTER_SHORT"}:
+                        shadow_direction = (
+                            "LONG" if early_decision.action == "ENTER_LONG" else "SHORT"
+                        )
+                        shadow_entry_bar = partial_timestamp
+                        shadow_entry_action = early_decision.action
+                        shadow_last_signal_bar = partial_timestamp
+                        live_underlying = float(partial_bar.iloc[-1]["close"])
+                        notifier.notify(
+                            _format_intrabar_shadow_alert(
+                                early_decision.action,
+                                live_underlying,
+                                observed_at,
+                            )
+                        )
+                        dashboard_state.record_event(
+                            {
+                                "at": observed_at.isoformat(),
+                                "level": "SIGNAL",
+                                "message": f"Early shadow {early_decision.action} signal",
+                            }
+                        )
         dashboard_state.update_market(
             status=market_data_status,
             underlying=underlying_symbol,

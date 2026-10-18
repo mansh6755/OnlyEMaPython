@@ -7,6 +7,18 @@ five-minute bars, and applies the shared EMA signal logic. Bullish signals buy o
 ATM CE and bearish signals buy one ATM PE for the first listed expiry in the next
 ISO week. Contract symbols and lot sizes come from Fyers' NSE derivatives master.
 
+Optional `EMA_EARLY_SIGNAL_SHADOW=true` checks the forming five-minute candle
+against the same entry rules using Fyers one-minute history snapshots. It sends
+early entry/exit alerts and records whether an early entry still qualifies at
+the five-minute close; it never places shadow orders. The regular runner remains
+close-confirmed. This is snapshot-based, not tick-precise: the first observed
+signal time is bounded by the polling interval and Fyers candle updates. When
+enabled, polling defaults to five seconds if `EMA_POLL_SECONDS` is unset. The
+example environment file sets it to 30, so change it to 5 to get faster shadow
+snapshots. Use this mode to collect paper comparisons before considering
+execution changes. The initial comparison is at the signal level; it does not
+estimate option fills or shadow-trade P&L.
+
 The runner is paper-only by default. To enable real orders, configure the Fyers
 credentials below and explicitly set `LIVE_TRADING_ENABLED=true` in the ignored
 `Dependencies/.env` file. Live startup refuses to proceed if the Fyers account has
