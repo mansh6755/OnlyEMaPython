@@ -11,6 +11,8 @@ from Dependencies.fyers_ema_replay import (
     _parse_cache_flag,
     _quote_at,
     replay,
+    replay_index_only,
+    _fetch_index_history,
 )
 
 
@@ -188,6 +190,53 @@ def test_history_cache_reports_corrupt_files_instead_of_silently_refetching(tmp_
     with pytest.raises(RuntimeError, match="Clear that cache file"):
         cache.history(api, "NSE:NIFTY50-INDEX", **request)
     assert len(api.requests) == 1
+
+
+def test_fetch_index_history_uses_one_day_requests_and_requested_symbol():
+    bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    api = _FakeAPI(bars)
+
+    result = _fetch_index_history(
+        api,
+        date(2026, 10, 19),
+        date(2026, 10, 20),
+        symbol="BSE:SENSEX-INDEX",
+    )
+
+    assert result.empty
+    assert [request[0] for request in api.requests] == ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX"]
+    assert [request[1]["start"] for request in api.requests] == [date(2026, 10, 19), date(2026, 10, 20)]
+    assert [request[1]["end"] for request in api.requests] == [date(2026, 10, 19), date(2026, 10, 20)]
+
+
+def test_index_only_replay_reports_directional_points_without_option_data():
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-10-15T09:15:00+05:30", periods=5, freq="5min"),
+            "open": [99.0, 99.0, 100.0, 101.0, 102.0],
+            "high": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "low": [98.0, 98.0, 99.0, 100.0, 101.0],
+            "close": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "volume": [10.0] * 5,
+        }
+    )
+
+    trades, counters = replay_index_only(
+        signal_logic=_FakeLogic,
+        strategy_config=None,
+        index_bars=bars,
+        start=date(2026, 10, 15),
+        end=date(2026, 10, 15),
+        poll_seconds=30,
+    )
+
+    assert len(trades) == 1
+    assert trades.iloc[0]["signal"] == "ENTER_LONG"
+    assert trades.iloc[0]["entry_index"] == 101.0
+    assert trades.iloc[0]["exit_index"] == 102.0
+    assert trades.iloc[0]["index_points"] == 1.0
+    assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
+    assert counters == {"signals": 1, "entries": 1, "exits": 1}
 
 
 def test_history_cache_refresh_replaces_cached_candles(tmp_path):

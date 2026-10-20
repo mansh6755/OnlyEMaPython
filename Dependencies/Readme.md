@@ -37,6 +37,17 @@ by default (`EMA_REPLAY_USE_CACHE=true`). Use `--useCache=true` to enable cache,
 writing cache, or `--refresh-cache` to fetch and replace cached candles. The
 command writes an auditable trade CSV and summary under `Backtest Outputs/`.
 
+To test the EMA signals against the underlying index only, use
+`python algo.py fyers-backtest --instrument index --start-date YYYY-MM-DD --end-date YYYY-MM-DD`.
+It defaults to NIFTY; pass `--index sensex` to use Fyers' `BSE:SENSEX-INDEX`
+history instead. This mode uses the same completed five-minute signal rules and reports
+directional index points per trade; it does not fetch option contracts or
+premiums. Entry and exit prices use the index close available at the simulated
+decision. Results are not rupee P&L, and no lot multiplier, fees, slippage, or
+rupee-denominated daily max-loss rule is applied. Index history is requested
+one calendar day at a time to avoid Fyers range-request failures. SENSEX index
+testing is index-only; the options replay remains NIFTY-only.
+
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
 

@@ -39,6 +39,12 @@ The commands:
     fyers-backtest Replay the live EMA process using Fyers index and option history.
       python algo.py fyers-backtest --start-date 2026-10-15 --end-date 2026-10-15
 
+      Add --instrument index to measure directional NIFTY index points without
+      fetching option contracts or option history:
+      python algo.py fyers-backtest --instrument index --start-date 2026-10-15 --end-date 2026-10-15
+      Use --index sensex to replay SENSEX instead:
+      python algo.py fyers-backtest --instrument index --index sensex --start-date 2026-10-15 --end-date 2026-10-15
+
     setup-token  One-time Fyers OAuth login that writes an access token into .env.
                Interactive (opens a browser / asks you to paste a code).
       python algo.py setup-token
@@ -198,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "fyers-backtest",
-        help="Replay the live EMA process with Fyers historical index and option candles.",
+        help="Replay EMA signals using Fyers index points or historical option candles.",
         add_help=False,
     )
 

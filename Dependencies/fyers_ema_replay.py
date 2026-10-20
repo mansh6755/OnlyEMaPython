@@ -38,6 +38,10 @@ ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
 OUTPUT_DIR = ROOT_DIR / "Backtest Outputs"
 IST = ZoneInfo("Asia/Kolkata")
 UNDERLYING_SYMBOL = "NSE:NIFTY50-INDEX"
+INDEX_SYMBOLS = {
+    "nifty": ("NIFTY", "NSE:NIFTY50-INDEX"),
+    "sensex": ("SENSEX", "BSE:SENSEX-INDEX"),
+}
 MARKET_OPEN = time(9, 15)
 ENTRY_START = time(9, 25)
 SQUARE_OFF = time(15, 15)
@@ -234,20 +238,24 @@ def _fetch_index_history(
     start: date,
     end: date,
     history_cache: FyersHistoryCache | None = None,
+    *,
+    symbol: str = UNDERLYING_SYMBOL,
 ) -> pd.DataFrame:
     frames = []
-    for left, right in _history_chunks(start, end):
+    day = start
+    while day <= end:
         if history_cache is None:
-            frame = api.history(UNDERLYING_SYMBOL, resolution="1", start=left, end=right)
+            frame = api.history(symbol, resolution="1", start=day, end=day)
         else:
             frame = history_cache.history(
                 api,
-                UNDERLYING_SYMBOL,
+                symbol,
                 resolution="1",
-                start=left,
-                end=right,
+                start=day,
+                end=day,
             )
         frames.append(frame)
+        day += timedelta(days=1)
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -374,6 +382,167 @@ def _action_polls(day: date, poll_seconds: int) -> list[pd.Timestamp]:
     start = pd.Timestamp(datetime.combine(day, MARKET_OPEN), tz=IST)
     end = pd.Timestamp(datetime.combine(day, SQUARE_OFF), tz=IST) + pd.Timedelta(seconds=poll_seconds)
     return list(pd.date_range(start, end, freq=pd.Timedelta(seconds=poll_seconds)))
+
+
+def replay_index_only(
+    *,
+    signal_logic: Any,
+    strategy_config: Any,
+    index_bars: pd.DataFrame,
+    index_name: str = "NIFTY",
+    start: date,
+    end: date,
+    poll_seconds: int = 30,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Replay EMA signals using NIFTY index points, without option data."""
+    if poll_seconds <= 0 or poll_seconds > 120:
+        raise ValueError("poll_seconds must be between 1 and 120.")
+    if start > end:
+        raise ValueError("start date must not be after end date.")
+    if index_bars.empty:
+        raise ValueError("Fyers returned no complete NIFTY five-minute bars.")
+
+    enriched = signal_logic.build_ema_trend_with_indicators(index_bars, strategy_config)
+    if enriched.empty:
+        raise ValueError("The EMA indicator builder returned no usable bars.")
+    bar_times = pd.to_datetime(enriched["timestamp"], errors="coerce")
+    bar_times = bar_times.dt.tz_localize(IST) if bar_times.dt.tz is None else bar_times.dt.tz_convert(IST)
+    indexes_by_day: dict[date, list[int]] = {}
+    for index, timestamp in enumerate(bar_times):
+        if pd.isna(timestamp):
+            continue
+        if start <= timestamp.date() <= end:
+            indexes_by_day.setdefault(timestamp.date(), []).append(index)
+
+    engine = signal_logic.EMATrendSignalEngine(strategy_config)
+    trades: list[dict[str, Any]] = []
+    counters = {"signals": 0, "entries": 0, "exits": 0}
+    position: dict[str, Any] | None = None
+
+    def close_position(at: pd.Timestamp, spot: float, reason: str) -> None:
+        nonlocal position
+        assert position is not None
+        direction_multiplier = 1.0 if position["action"] == "ENTER_LONG" else -1.0
+        trades.append(
+            {
+                "signal_bar_start": position["signal_timestamp"].isoformat(),
+                "signal_time": (position["signal_timestamp"] + pd.Timedelta(minutes=5)).isoformat(),
+                "entry_time": position["entry_timestamp"].isoformat(),
+                "exit_time": at.isoformat(),
+                "signal": position["action"],
+                "exit_reason": reason,
+                "entry_index": position["entry_price"],
+                "exit_index": spot,
+                "index_points": direction_multiplier * (spot - position["entry_price"]),
+            }
+        )
+        counters["exits"] += 1
+        position = None
+
+    for day in sorted(indexes_by_day):
+        day_indexes = indexes_by_day[day]
+        next_bar = 0
+        current_index: int | None = None
+        last_processed: pd.Timestamp | None = None
+        for now in _action_polls(day, poll_seconds):
+            while (
+                next_bar < len(day_indexes)
+                and bar_times.iloc[day_indexes[next_bar]] + pd.Timedelta(minutes=5) <= now
+            ):
+                current_index = day_indexes[next_bar]
+                next_bar += 1
+            current = enriched.iloc[current_index] if current_index is not None else None
+            current_timestamp = bar_times.iloc[current_index] if current_index is not None else None
+
+            if now.timetz().replace(tzinfo=None) >= SQUARE_OFF:
+                if position is not None and current is not None:
+                    close_position(now, float(current["close"]), "SQUARE_OFF")
+                break
+
+            decision = signal_logic.EMATrendDecision()
+            if current is not None and current_timestamp != last_processed:
+                context = None
+                if position is not None:
+                    context = signal_logic.EMATrendPositionContext(
+                        direction="LONG" if position["action"] == "ENTER_LONG" else "SHORT",
+                        entry_underlying=position["entry_price"],
+                        stop_underlying=float(current.get("ema11", 0.0)),
+                    )
+                decision = engine.evaluate_candle(enriched.iloc[: current_index + 1], position=context)
+                last_processed = current_timestamp
+                if decision.signal_triggered:
+                    counters["signals"] += 1
+
+            if position is not None:
+                if decision.action == "EXIT":
+                    close_position(now, float(current["close"]), decision.exit_reason or "EMA11_EXIT")
+                continue
+
+            if current is None or decision.action not in {"ENTER_LONG", "ENTER_SHORT"}:
+                continue
+            close_time = current_timestamp + pd.Timedelta(minutes=5)
+            age = now - close_time
+            entry_allowed = (
+                ENTRY_START <= now.timetz().replace(tzinfo=None) < SQUARE_OFF
+                and current_timestamp.date() == day
+                and timedelta(0) <= age.to_pytimedelta() <= MAX_ENTRY_BAR_AGE
+            )
+            if not entry_allowed:
+                continue
+            position = {
+                "action": decision.action,
+                "signal_timestamp": current_timestamp,
+                "entry_timestamp": now,
+                "entry_price": float(current["close"]),
+            }
+            counters["entries"] += 1
+
+    if position is not None:
+        raise RuntimeError("Index replay ended with an open position; the requested data range is incomplete.")
+    return pd.DataFrame(trades), counters
+
+
+def _report_index(
+    trades: pd.DataFrame,
+    counters: dict[str, int],
+    index_name: str,
+    start: date,
+    end: date,
+    poll_seconds: int,
+    history_cache: FyersHistoryCache,
+) -> tuple[Path, Path]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"fyers_ema_{index_name.lower()}_index_replay_{start:%Y%m%d}_{end:%Y%m%d}"
+    trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
+    summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
+    trades.to_csv(trades_path, index=False)
+    points = pd.to_numeric(trades.get("index_points", pd.Series(dtype=float)), errors="coerce").dropna()
+    winners, losers = points[points > 0], points[points < 0]
+    cumulative = points.cumsum()
+    drawdown = cumulative - cumulative.cummax() if not cumulative.empty else pd.Series(dtype=float)
+    lines = [
+        f"{index_name} index-only EMA replay: {start} through {end}",
+        f"Signals use the shared EMA logic on complete Fyers {index_name} five-minute candles.",
+        "Entry and exit prices are the index close available at the simulated decision; no option data is used.",
+        f"Simulated poll interval: {poll_seconds}s.",
+        "Results are directional index points, not rupee P&L; no lot multiplier, brokerage, or slippage is applied.",
+        "Daily max loss is not applied because its live setting is denominated in rupees.",
+        f"Historical index cache: {'enabled' if history_cache.enabled else 'disabled'}; "
+        f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
+        f"Signals: {counters['signals']}",
+        f"Entries: {counters['entries']}",
+        f"Exits: {counters['exits']}",
+        f"Completed trades: {len(trades)}",
+        f"Win rate: {(len(winners) / len(points) * 100.0) if len(points) else 0.0:.2f}%",
+        f"Average winning points: {float(winners.mean()) if not winners.empty else 0.0:.2f}",
+        f"Average losing points: {float(losers.mean()) if not losers.empty else 0.0:.2f}",
+        f"Net directional index points: {float(points.sum()) if not points.empty else 0.0:.2f}",
+        f"Max trade-equity drawdown (points): {float(drawdown.min()) if not drawdown.empty else 0.0:.2f}",
+        f"Trades CSV: {trades_path}",
+    ]
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    return trades_path, summary_path
 
 
 def replay(
@@ -675,9 +844,21 @@ def _report(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Replay the live Fyers EMA process against historical option candles.")
+    parser = argparse.ArgumentParser(description="Replay EMA signals using Fyers index or option history.")
     parser.add_argument("--start-date", required=True, help="Inclusive YYYY-MM-DD date.")
     parser.add_argument("--end-date", required=True, help="Inclusive YYYY-MM-DD date.")
+    parser.add_argument(
+        "--instrument",
+        choices=("options", "index"),
+        default="options",
+        help="Replay using option-premium estimates (default) or directional index points.",
+    )
+    parser.add_argument(
+        "--index",
+        choices=tuple(INDEX_SYMBOLS),
+        default="nifty",
+        help="Underlying index for --instrument index (default: nifty). Options replay supports NIFTY only.",
+    )
     parser.add_argument("--lots", type=int, default=None)
     parser.add_argument("--max-daily-loss", type=float, default=None)
     parser.add_argument("--poll-seconds", type=int, default=None)
@@ -732,19 +913,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Set FYERS_APP_ID and a valid FYERS_ACCESS_TOKEN/token file in Dependencies/.env")
 
     try:
-        lots = args.lots if args.lots is not None else int(os.getenv("EMA_LOTS", "1"))
         poll_seconds = args.poll_seconds if args.poll_seconds is not None else int(os.getenv("EMA_POLL_SECONDS", "30"))
-        max_daily_loss = (
-            args.max_daily_loss if args.max_daily_loss is not None else float(os.getenv("EMA_MAX_LOSS", "5500"))
-        )
+        if args.instrument == "options":
+            lots = args.lots if args.lots is not None else int(os.getenv("EMA_LOTS", "1"))
+            max_daily_loss = (
+                args.max_daily_loss if args.max_daily_loss is not None else float(os.getenv("EMA_MAX_LOSS", "5500"))
+            )
     except ValueError as exc:
         parser.error(f"Invalid EMA replay configuration: {exc}")
-    if lots <= 0 or poll_seconds <= 0 or not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
-        parser.error("lots, poll-seconds, and max-daily-loss must be positive; loss must be finite.")
-    if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_WEEK").strip().upper() != "NEXT_WEEK":
-        parser.error("This replay supports EMA_OPTION_EXPIRY_POLICY=NEXT_WEEK only.")
-    if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
-        parser.error("This replay supports EMA_OPTION_STRIKE_POLICY=ATM only.")
+    if poll_seconds <= 0 or poll_seconds > 120:
+        parser.error("poll-seconds must be between 1 and 120.")
+    if args.instrument == "options":
+        if args.index != "nifty":
+            parser.error("--index sensex is only supported with --instrument index.")
+        if lots <= 0 or not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
+            parser.error("lots and max-daily-loss must be positive; loss must be finite.")
+        if os.getenv("EMA_OPTION_EXPIRY_POLICY", "NEXT_WEEK").strip().upper() != "NEXT_WEEK":
+            parser.error("This replay supports EMA_OPTION_EXPIRY_POLICY=NEXT_WEEK only.")
+        if os.getenv("EMA_OPTION_STRIKE_POLICY", "ATM").strip().upper() != "ATM":
+            parser.error("This replay supports EMA_OPTION_STRIKE_POLICY=ATM only.")
     option_resolution = args.option_resolution
     if option_resolution == "auto":
         option_resolution = "5S" if start >= date.today() - timedelta(days=35) else "1"
@@ -774,11 +961,31 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh_cache,
     )
     try:
-        raw_index = _fetch_index_history(api, start - timedelta(days=7), end, history_cache)
+        index_name, index_symbol = INDEX_SYMBOLS[args.index]
+        raw_index = _fetch_index_history(
+            api,
+            start - timedelta(days=7),
+            end,
+            history_cache,
+            symbol=index_symbol,
+        )
         if raw_index.empty:
-            raise RuntimeError("Fyers returned no index candles for the selected period.")
+            raise RuntimeError(f"Fyers returned no {index_name} index candles for the selected period.")
         end_of_range = datetime.combine(end + timedelta(days=1), time.min, tzinfo=IST)
         index_bars = completed_five_minute_bars(raw_index, end_of_range)
+        if args.instrument == "index":
+            trades, counters = replay_index_only(
+                signal_logic=logic,
+                strategy_config=config,
+                index_bars=index_bars,
+                index_name=index_name,
+                start=start,
+                end=end,
+                poll_seconds=poll_seconds,
+            )
+            _report_index(trades, counters, index_name, start, end, poll_seconds, history_cache)
+            return 0
+
         active_rows = api.option_master()
         active_expiries = {
             expiry
