@@ -166,6 +166,17 @@ def test_replace_access_token_persists_and_updates_future_request_headers(monkey
     assert os.environ["FYERS_ACCESS_TOKEN"] == "new-token"
 
 
+def test_clear_access_token_removes_active_token_and_environment(monkeypatch):
+    api = FyersAPI("app-100", "old-token", session=_Session(_Response({"s": "ok"})))
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "old-token")
+
+    api.clear_access_token()
+
+    assert api.access_token == ""
+    assert api._headers["Authorization"] == "app-100:"
+    assert "FYERS_ACCESS_TOKEN" not in os.environ
+
+
 def test_validate_session_raises_when_fyers_rejects_session():
     api = FyersAPI("app-100", "test-token", session=_Session(_Response({"s": "no"})))
 

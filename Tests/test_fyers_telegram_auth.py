@@ -1,23 +1,34 @@
 import http.client
 import json
+import os
 import socket
 import threading
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from Dependencies import fyers_telegram_auth as auth
 
+IST = ZoneInfo("Asia/Kolkata")
+
 
 class _FakeMarketDataClient:
     def __init__(self) -> None:
         self.installed_token: str | None = None
+        self.active_token = "active-token"
         self.session_valid = True
+
+    def clear_access_token(self) -> None:
+        self.active_token = ""
+        os.environ.pop("FYERS_ACCESS_TOKEN", None)
 
     def replace_access_token(self, token: str, *, persist) -> None:
         persist(token)
         self.installed_token = token
+        self.active_token = token
         self.session_valid = True
 
     def validate_session(self) -> None:
@@ -44,6 +55,49 @@ def _service(tmp_path: Path) -> auth.FyersTelegramAuthService:
     )
 
 
+def test_daily_authentication_is_scheduled_at_nine_ist_on_weekdays():
+    before_nine = datetime(2026, 10, 22, 8, 59, tzinfo=IST)
+    at_nine = datetime(2026, 10, 22, 9, 0, tzinfo=IST)
+
+    assert auth.next_daily_authentication_at(before_nine) == datetime(
+        2026, 10, 22, 9, 0, tzinfo=IST
+    )
+    assert auth.next_daily_authentication_at(at_nine) == datetime(
+        2026, 10, 23, 9, 0, tzinfo=IST
+    )
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 10, 23, 9, 1, tzinfo=IST),
+        datetime(2026, 10, 24, 8, 0, tzinfo=IST),
+        datetime(2026, 10, 25, 12, 0, tzinfo=IST),
+    ],
+)
+def test_daily_authentication_skips_weekends(now):
+    assert auth.next_daily_authentication_at(now) == datetime(
+        2026, 10, 26, 9, 0, tzinfo=IST
+    )
+
+
+def test_daily_authentication_scheduler_requests_a_fresh_link(monkeypatch, tmp_path):
+    service = _service(tmp_path)
+    request_auth = Mock(side_effect=lambda _reason: service._stop_event.set())
+    service.request_authorization = request_auth
+    monkeypatch.setattr(
+        auth,
+        "next_daily_authentication_at",
+        lambda _now: datetime.now(IST),
+    )
+
+    service._schedule_daily_authentication()
+
+    request_auth.assert_called_once()
+    assert "Daily Fyers authentication" in request_auth.call_args.args[0]
+    service._httpd.server_close()
+
+
 def test_persisted_token_takes_precedence_over_environment_fallback(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("stored-token\n", encoding="utf-8")
@@ -59,6 +113,65 @@ def test_access_token_is_atomically_persisted_with_private_permissions(tmp_path)
 
     assert token_file.read_text(encoding="utf-8") == "new-token"
     assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_clear_saved_access_tokens_removes_token_file_and_env_entry(tmp_path):
+    token_file = tmp_path / "persistent-token"
+    token_file.write_text("old-token", encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FYERS_APP_ID=app-id\nFYERS_ACCESS_TOKEN=old-token\nOTHER_SETTING=keep\n",
+        encoding="utf-8",
+    )
+
+    auth.clear_saved_access_tokens(token_file, env_file)
+
+    assert not token_file.exists()
+    assert env_file.read_text(encoding="utf-8") == "FYERS_APP_ID=app-id\nOTHER_SETTING=keep\n"
+
+
+def test_authorization_clears_saved_and_active_token_before_notifying(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    token_file = tmp_path / "fyers_access_token"
+    token_file.write_text("old-token", encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("FYERS_ACCESS_TOKEN=old-token\n", encoding="utf-8")
+    monkeypatch.setattr(auth, "ENV_FILE", env_file)
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "old-token")
+    service.token_file = token_file
+    notifications = []
+
+    def capture_notification(message: str) -> None:
+        notifications.append(message)
+        assert not token_file.exists()
+        assert "FYERS_ACCESS_TOKEN" not in env_file.read_text(encoding="utf-8")
+        assert "FYERS_ACCESS_TOKEN" not in os.environ
+        assert service.market_data_client.active_token == ""
+
+    service._notify = capture_notification
+
+    service.request_authorization("Daily Fyers authentication")
+
+    assert len(notifications) == 1
+    service._httpd.server_close()
+
+
+def test_authorization_does_not_notify_when_token_cleanup_fails(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    notify = Mock()
+    service._notify = notify
+    monkeypatch.setattr(
+        auth,
+        "clear_saved_access_tokens",
+        Mock(side_effect=OSError("permission denied")),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not clear saved Fyers tokens"):
+        service.request_authorization("Daily Fyers authentication")
+
+    notify.assert_not_called()
+    assert service.market_data_client.active_token == "active-token"
+    service._httpd.server_close()
 
 
 def test_callback_checks_state_exchanges_code_and_persists_token(tmp_path, monkeypatch):

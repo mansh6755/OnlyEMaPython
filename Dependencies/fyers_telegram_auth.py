@@ -6,13 +6,16 @@ import json
 import logging
 import os
 import secrets
+import stat
 import tempfile
 import threading
 import time
+from datetime import datetime, time as day_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse, urlsplit
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -22,6 +25,9 @@ LOGGER = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org"
 AUTH_CODE_TTL_SECONDS = 10 * 60
 SESSION_CHECK_INTERVAL_SECONDS = 5 * 60
+AUTHENTICATION_TIME = day_time(9, 0)
+IST = ZoneInfo("Asia/Kolkata")
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 HTTP_TIMEOUT_SECONDS = (5.0, 30.0)
 DASHBOARD_ASSETS_DIR = Path(__file__).resolve().parent / "dashboard_assets"
 DASHBOARD_ASSET_ROUTES = {
@@ -33,6 +39,18 @@ DASHBOARD_ASSET_ROUTES = {
         "text/javascript; charset=utf-8",
     ),
 }
+
+
+def next_daily_authentication_at(now: datetime) -> datetime:
+    """Return the next 9:00 AM IST slot that falls Monday through Friday."""
+    local_now = now.astimezone(IST)
+    candidate_date = local_now.date()
+    for _ in range(7):
+        candidate = datetime.combine(candidate_date, AUTHENTICATION_TIME, tzinfo=IST)
+        if candidate > local_now and candidate.weekday() < 5:
+            return candidate
+        candidate_date += timedelta(days=1)
+    raise RuntimeError("Unable to find the next weekday Fyers authentication time.")
 
 
 def load_persisted_access_token(token_file: Path, fallback: str = "") -> str:
@@ -70,6 +88,46 @@ def persist_access_token(token_file: Path, access_token: str) -> None:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def clear_saved_access_tokens(token_file: Path, env_file: Path = ENV_FILE) -> None:
+    """Remove saved token copies before requesting a fresh Fyers authorization."""
+    env_path = env_file.resolve()
+    if env_file.exists():
+        lines = env_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        retained_lines = []
+        for line in lines:
+            assignment = line.lstrip()
+            if assignment.startswith("export "):
+                assignment = assignment[len("export ") :].lstrip()
+            key, separator, _value = assignment.partition("=")
+            if separator and key.strip() == "FYERS_ACCESS_TOKEN":
+                continue
+            retained_lines.append(line)
+
+        if len(retained_lines) != len(lines):
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=env_file.parent,
+                    prefix=f".{env_file.name}.",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write("".join(retained_lines))
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                temporary_path.chmod(stat.S_IMODE(env_file.stat().st_mode))
+                os.replace(temporary_path, env_file)
+                temporary_path = None
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+    if token_file.resolve() != env_path:
+        token_file.unlink(missing_ok=True)
 
 
 class FyersTelegramAuthService:
@@ -140,6 +198,11 @@ class FyersTelegramAuthService:
         self._auth_prompted = False
         self._next_session_check_at = time.monotonic() + SESSION_CHECK_INTERVAL_SECONDS
         self._poll_thread: threading.Thread | None = None
+        self._authentication_thread = threading.Thread(
+            target=self._schedule_daily_authentication,
+            name="FyersDailyAuthentication",
+            daemon=True,
+        )
         self._httpd = self._build_http_server()
         self.port = self._httpd.server_port
         self._http_thread = threading.Thread(
@@ -235,6 +298,7 @@ class FyersTelegramAuthService:
             daemon=True,
         )
         self._poll_thread.start()
+        self._authentication_thread.start()
         LOGGER.info("Fyers Telegram authentication callback listening on port %s.", self.port)
 
     def stop(self, timeout: float = 2.0) -> None:
@@ -247,9 +311,17 @@ class FyersTelegramAuthService:
             self._http_thread.join(timeout=timeout)
         if self._poll_thread is not None:
             self._poll_thread.join(timeout=timeout)
+        if self._authentication_thread.is_alive():
+            self._authentication_thread.join(timeout=timeout)
 
     def request_authorization(self, reason: str) -> None:
         """Send a fresh, one-use Fyers login link to the authorized chat."""
+        try:
+            clear_saved_access_tokens(self.token_file, ENV_FILE)
+        except (OSError, UnicodeError) as exc:
+            LOGGER.error("Could not clear saved Fyers tokens; authorization link was not sent.")
+            raise RuntimeError("Could not clear saved Fyers tokens.") from exc
+        self.market_data_client.clear_access_token()
         state = secrets.token_urlsafe(32)
         with self._state_lock:
             self._pending_state = state
@@ -260,6 +332,21 @@ class FyersTelegramAuthService:
             f"{reason}\n\nOpen this Fyers authorization link and approve access:\n{auth_url}\n\n"
             "This one-use link expires in 10 minutes. The access token is never sent in Telegram."
         )
+
+    def _schedule_daily_authentication(self) -> None:
+        while not self._stop_event.is_set():
+            scheduled_at = next_daily_authentication_at(datetime.now(IST))
+            delay = max(0.0, (scheduled_at - datetime.now(IST)).total_seconds())
+            if self._stop_event.wait(delay):
+                return
+            if self._stop_event.is_set():
+                return
+            try:
+                self.request_authorization(
+                    "Daily Fyers authentication: approve access to refresh today's trading session."
+                )
+            except RuntimeError as exc:
+                LOGGER.error("Daily Fyers authorization prompt was not sent: %s", exc)
 
     def authenticate_startup(self, *, has_access_token: bool) -> None:
         """Validate the stored token or wait for a Telegram-approved token."""

@@ -168,6 +168,15 @@ class FyersAPI:
         }
         os.environ["FYERS_ACCESS_TOKEN"] = refreshed_token
 
+    def clear_access_token(self) -> None:
+        """Remove the active token from this client and the process environment."""
+        self.access_token = ""
+        self._headers = {
+            **self._headers,
+            "Authorization": f"{self.app_id}:",
+        }
+        os.environ.pop("FYERS_ACCESS_TOKEN", None)
+
     def validate_session(self) -> None:
         profile = self.profile()
         if profile.get("s") != "ok":
