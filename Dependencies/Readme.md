@@ -21,7 +21,10 @@ extra link. Before sending any authorization link, the service removes the saved
 token file, any `FYERS_ACCESS_TOKEN` entry from `.env`, the process-environment copy,
 and the active in-memory Fyers token. Fyers API calls will not work again until the
 callback completes successfully, so finish the approval before the 9:25 AM entry
-window. The 9:00 AM prompt is only sent while the service is running.
+window. After the 3:15 PM square-off, the process remains alive but stops market-data
+polling and waits with low activity until the next weekday's 9:25 AM session start.
+The Telegram poller and `/callback` server remain available overnight. The 9:00 AM
+prompt is only sent while the service is running.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.

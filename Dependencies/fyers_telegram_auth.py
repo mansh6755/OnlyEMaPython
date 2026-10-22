@@ -190,6 +190,7 @@ class FyersTelegramAuthService:
         )
         self._stop_event = threading.Event()
         self._token_updated = threading.Event()
+        self._authorization_pending = threading.Event()
         self._state_lock = threading.Lock()
         self._pending_state: str | None = None
         self._pending_state_expires_at = 0.0
@@ -316,6 +317,8 @@ class FyersTelegramAuthService:
 
     def request_authorization(self, reason: str) -> None:
         """Send a fresh, one-use Fyers login link to the authorized chat."""
+        self._authorization_pending.set()
+        self._token_updated.clear()
         try:
             clear_saved_access_tokens(self.token_file, ENV_FILE)
         except (OSError, UnicodeError) as exc:
@@ -387,6 +390,7 @@ class FyersTelegramAuthService:
 
         self.market_data_client.replace_access_token(access_token, persist=persist)
         self.market_data_client.validate_session()
+        self._authorization_pending.clear()
         self._token_updated.set()
         self._auth_prompted = False
         self._notify(
@@ -394,6 +398,14 @@ class FyersTelegramAuthService:
             "and saved to persistent storage."
         )
         LOGGER.info("Fyers access token refreshed and persisted; token value was not logged.")
+
+    def wait_for_access_token(self) -> None:
+        """Block trading startup while a requested Fyers authorization is pending."""
+        if not self._authorization_pending.is_set():
+            return
+        LOGGER.info("Waiting for the requested Fyers authorization callback.")
+        self._token_updated.wait()
+        self.market_data_client.validate_session()
 
     def _consume_state(self, returned_state: str) -> bool:
         with self._state_lock:

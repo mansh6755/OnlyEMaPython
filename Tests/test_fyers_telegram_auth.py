@@ -174,6 +174,24 @@ def test_authorization_does_not_notify_when_token_cleanup_fails(tmp_path, monkey
     service._httpd.server_close()
 
 
+def test_wait_for_access_token_blocks_while_authorization_is_pending(tmp_path):
+    service = _service(tmp_path)
+    service._authorization_pending.set()
+    finished = threading.Event()
+    waiter = threading.Thread(
+        target=lambda: (service.wait_for_access_token(), finished.set()),
+        daemon=True,
+    )
+    waiter.start()
+
+    assert not finished.wait(timeout=0.05)
+    service._token_updated.set()
+    waiter.join(timeout=1)
+
+    assert finished.is_set()
+    service._httpd.server_close()
+
+
 def test_callback_checks_state_exchanges_code_and_persists_token(tmp_path, monkeypatch):
     service = _service(tmp_path)
     service._pending_state = "expected-state"

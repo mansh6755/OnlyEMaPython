@@ -24,10 +24,40 @@ from Dependencies.fyers_ema_runner import (
     _format_strategy_started_alert,
     completed_five_minute_bars,
     daily_loss_limit_reached,
+    next_trading_session_start_at,
 )
 from Dependencies.fyers_options import FyersOptionContract
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (
+            datetime(2026, 10, 22, 8, 0, tzinfo=IST),
+            datetime(2026, 10, 22, 9, 25, tzinfo=IST),
+        ),
+        (
+            datetime(2026, 10, 22, 10, 0, tzinfo=IST),
+            datetime(2026, 10, 22, 10, 0, tzinfo=IST),
+        ),
+        (
+            datetime(2026, 10, 22, 15, 15, tzinfo=IST),
+            datetime(2026, 10, 23, 9, 25, tzinfo=IST),
+        ),
+        (
+            datetime(2026, 10, 23, 15, 16, tzinfo=IST),
+            datetime(2026, 10, 26, 9, 25, tzinfo=IST),
+        ),
+        (
+            datetime(2026, 10, 24, 12, 0, tzinfo=IST),
+            datetime(2026, 10, 26, 9, 25, tzinfo=IST),
+        ),
+    ],
+)
+def test_next_trading_session_start_at(now, expected):
+    assert next_trading_session_start_at(now) == expected
 
 
 def test_completed_five_minute_bars_aggregates_only_closed_full_bars():
@@ -289,6 +319,7 @@ def test_runner_reports_fatal_error_to_telegram_then_reraises(monkeypatch):
     monkeypatch.setattr(ema_runner, "load_persisted_access_token", lambda *_args: "valid-test-token")
     monkeypatch.setattr(ema_runner, "FyersAPI", lambda *_args: object())
     monkeypatch.setattr(ema_runner, "FyersTelegramAuthService", lambda **_kwargs: auth_service)
+    monkeypatch.setattr(ema_runner, "next_trading_session_start_at", lambda now: now)
 
     def fail_runner(*_args):
         raise RuntimeError("runner exploded")

@@ -33,6 +33,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
 IST = ZoneInfo("Asia/Kolkata")
 LOGGER = logging.getLogger("fyers_ema_runner")
+TRADING_START_TIME = day_time(9, 25)
+TRADING_END_TIME = day_time(15, 15)
 
 
 @dataclass(slots=True)
@@ -304,6 +306,21 @@ def _entry_bar_is_fresh(timestamp: pd.Timestamp, now: datetime) -> bool:
     return timestamp.date() == now.date() and timedelta(0) <= now - bar_close_time <= timedelta(minutes=2)
 
 
+def next_trading_session_start_at(now: datetime) -> datetime:
+    """Return now during an open weekday session, otherwise the next 9:25 AM IST."""
+    local_now = now.astimezone(IST)
+    candidate_date = local_now.date()
+    for _ in range(7):
+        if candidate_date.weekday() < 5:
+            session_start = datetime.combine(candidate_date, TRADING_START_TIME, tzinfo=IST)
+            if candidate_date > local_now.date() or local_now < session_start:
+                return session_start
+            if local_now.time() < TRADING_END_TIME:
+                return local_now
+        candidate_date += timedelta(days=1)
+    raise RuntimeError("Unable to find the next weekday EMA trading session.")
+
+
 def _close_position(
     api: FyersAPI,
     execution: FyersExecutionClient,
@@ -393,7 +410,22 @@ def run_ema_runner(signal_logic: Any, strategy_config: Any) -> None:
         dashboard_state.record_event(
             {"at": datetime.now(IST).isoformat(), "level": "SUCCESS", "message": "Fyers session authenticated"}
         )
-        _run_ema_runner(signal_logic, strategy_config, notifier, api, dashboard_state)
+        first_session = True
+        while True:
+            session_start = next_trading_session_start_at(datetime.now(IST))
+            delay = max(0.0, (session_start - datetime.now(IST)).total_seconds())
+            if delay > 0:
+                LOGGER.info("EMA trading is idle until %s IST.", session_start.isoformat())
+                dashboard_state.update_service(
+                    status="IDLE UNTIL NEXT SESSION",
+                    next_session_at=session_start.isoformat(),
+                )
+                time.sleep(delay)
+            auth_service.wait_for_access_token()
+            if not first_session:
+                notifier = TelegramNotifier.from_environment()
+            first_session = False
+            _run_ema_runner(signal_logic, strategy_config, notifier, api, dashboard_state)
     except Exception as exc:
         _notify_runner_error(notifier, "Unrecoverable runner error", exc, mode)
         notifier.close(timeout=10.0)
