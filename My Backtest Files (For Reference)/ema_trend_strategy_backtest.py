@@ -14,7 +14,7 @@ Flow:
 Beginner mental model:
 - `load_ohlc_data()` prepares clean historical candles.
 - `NiftyEMATrendFutures5YStrategy.next()` is called bar-by-bar by the framework.
-- Shared EMA logic decides entries and EMA11 exits.
+- Shared EMA logic decides entries and EMA9 exits.
 - `run_backtest()` wires config + engine together and executes the run.
 - `save_outputs()` exports results for later spreadsheet review.
 
@@ -248,7 +248,7 @@ class NiftyEMATrendFutures5YStrategy(Strategy):
         self.trade_direction = ""
         self.entry_underlying = 0.0
         # Stored for logs/debugging only; actual exit is dynamic when the candle
-        # range breaches EMA11 against the trade.
+        # range breaches EMA9 against the trade.
         self.stop_underlying = 0.0
 
         # These counters are not required for trading, but they are extremely

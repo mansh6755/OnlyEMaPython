@@ -48,6 +48,7 @@ SQUARE_OFF = time(15, 15)
 MAX_ENTRY_BAR_AGE = timedelta(minutes=2)
 HISTORY_CHUNK_DAYS = 90
 OPTION_RESOLUTION_SECONDS = {"5S": 5, "1": 60}
+INDEX_TRAILING_STOPS = ("none", "swing_2bar", "atr_2x", "breakeven_1r_ema9", "combined")
 HISTORY_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 CACHE_VERSION = 1
 
@@ -393,12 +394,18 @@ def replay_index_only(
     start: date,
     end: date,
     poll_seconds: int = 30,
+    max_daily_loss_points: float = 170.0,
+    trailing_stop: str = "none",
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Replay EMA signals using NIFTY index points, without option data."""
+    """Replay EMA signals on index points with a realized-plus-open daily loss cap."""
     if poll_seconds <= 0 or poll_seconds > 120:
         raise ValueError("poll_seconds must be between 1 and 120.")
     if start > end:
         raise ValueError("start date must not be after end date.")
+    if not math.isfinite(max_daily_loss_points) or max_daily_loss_points <= 0:
+        raise ValueError("max_daily_loss_points must be positive and finite.")
+    if trailing_stop not in INDEX_TRAILING_STOPS:
+        raise ValueError(f"trailing_stop must be one of {', '.join(INDEX_TRAILING_STOPS)}.")
     if index_bars.empty:
         raise ValueError("Fyers returned no complete NIFTY five-minute bars.")
 
@@ -416,13 +423,24 @@ def replay_index_only(
 
     engine = signal_logic.EMATrendSignalEngine(strategy_config)
     trades: list[dict[str, Any]] = []
-    counters = {"signals": 0, "entries": 0, "exits": 0}
+    counters = {"signals": 0, "entries": 0, "exits": 0, "daily_loss_halts": 0}
     position: dict[str, Any] | None = None
+    daily_realized_points = 0.0
+    if trailing_stop != "none":
+        required_trailing_columns = {"ema9", "atr"}
+        missing_trailing_columns = required_trailing_columns.difference(enriched.columns)
+        if missing_trailing_columns:
+            raise ValueError(
+                "Trailing stops require indicator columns: "
+                + ", ".join(sorted(missing_trailing_columns))
+            )
 
     def close_position(at: pd.Timestamp, spot: float, reason: str) -> None:
         nonlocal position
+        nonlocal daily_realized_points
         assert position is not None
         direction_multiplier = 1.0 if position["action"] == "ENTER_LONG" else -1.0
+        trade_points = direction_multiplier * (spot - position["entry_price"])
         trades.append(
             {
                 "signal_bar_start": position["signal_timestamp"].isoformat(),
@@ -433,14 +451,66 @@ def replay_index_only(
                 "exit_reason": reason,
                 "entry_index": position["entry_price"],
                 "exit_index": spot,
-                "index_points": direction_multiplier * (spot - position["entry_price"]),
+                "index_points": trade_points,
             }
         )
         counters["exits"] += 1
+        daily_realized_points += trade_points
         position = None
+
+    def update_trailing_stop(current_index: int) -> None:
+        if position is None or trailing_stop == "none":
+            return
+        current_bar = enriched.iloc[current_index]
+        is_long = position["action"] == "ENTER_LONG"
+        if is_long:
+            position["high_water"] = max(position["high_water"], float(current_bar["high"]))
+        else:
+            position["low_water"] = min(position["low_water"], float(current_bar["low"]))
+
+        armed_now = position["trailing_armed"] or (
+            position["initial_risk"] > 0
+            and (
+                position["high_water"] - position["entry_price"] >= position["initial_risk"]
+                if is_long
+                else position["entry_price"] - position["low_water"] >= position["initial_risk"]
+            )
+        )
+        position["trailing_armed"] = armed_now
+        candidates = [position["trailing_stop_price"]]
+
+        if trailing_stop in {"swing_2bar", "combined"} and current_index >= 1:
+            swing_bars = enriched.iloc[current_index - 1 : current_index + 1]
+            swing_stop = (
+                float(swing_bars["low"].min())
+                if is_long
+                else float(swing_bars["high"].max())
+            )
+            candidates.append(swing_stop)
+
+        if trailing_stop in {"atr_2x", "combined"}:
+            atr = float(current_bar["atr"])
+            if math.isfinite(atr) and atr > 0:
+                chandelier = (
+                    position["high_water"] - 2 * atr
+                    if is_long
+                    else position["low_water"] + 2 * atr
+                )
+                candidates.append(chandelier)
+
+        if trailing_stop in {"breakeven_1r_ema9", "combined"} and armed_now:
+            candidates.append(position["entry_price"])
+            ema9 = float(current_bar["ema9"])
+            if math.isfinite(ema9):
+                candidates.append(ema9)
+
+        tightened = max(candidates) if is_long else min(candidates)
+        position["trailing_stop_price"] = tightened
 
     for day in sorted(indexes_by_day):
         day_indexes = indexes_by_day[day]
+        daily_realized_points = 0.0
+        daily_loss_halted = False
         next_bar = 0
         current_index: int | None = None
         last_processed: pd.Timestamp | None = None
@@ -453,6 +523,69 @@ def replay_index_only(
                 next_bar += 1
             current = enriched.iloc[current_index] if current_index is not None else None
             current_timestamp = bar_times.iloc[current_index] if current_index is not None else None
+            is_new_bar = current_index is not None and current_timestamp != last_processed
+
+            if (
+                position is not None
+                and current is not None
+                and current_index is not None
+                and current_index > position["entry_bar_index"]
+            ):
+                direction_multiplier = 1.0 if position["action"] == "ENTER_LONG" else -1.0
+                trail_price = position["trailing_stop_price"]
+                trail_hit = is_new_bar and trailing_stop != "none" and (
+                    float(current["low"]) <= trail_price
+                    if direction_multiplier > 0
+                    else float(current["high"]) >= trail_price
+                )
+                remaining_loss_points = max_daily_loss_points + daily_realized_points
+                cap_price: float | None
+                if remaining_loss_points <= 0:
+                    cap_price = float(current["open"])
+                elif direction_multiplier > 0:
+                    cap_price = position["entry_price"] - remaining_loss_points
+                    if float(current["low"]) > cap_price:
+                        cap_price = None
+                else:
+                    cap_price = position["entry_price"] + remaining_loss_points
+                    if float(current["high"]) < cap_price:
+                        cap_price = None
+                cap_hit = cap_price is not None
+                cap_is_first = cap_hit and (
+                    not trail_hit
+                    or (
+                        cap_price is not None
+                        and (
+                            cap_price >= trail_price
+                            if direction_multiplier > 0
+                            else cap_price <= trail_price
+                        )
+                    )
+                )
+                if cap_is_first:
+                    assert cap_price is not None
+                    open_price = float(current["open"])
+                    exit_price = (
+                        min(open_price, cap_price)
+                        if direction_multiplier > 0
+                        else max(open_price, cap_price)
+                    )
+                    close_position(now, exit_price, "DAILY_MAX_LOSS")
+                    daily_loss_halted = True
+                    counters["daily_loss_halts"] += 1
+                    continue
+                if trail_hit:
+                    open_price = float(current["open"])
+                    exit_price = (
+                        min(open_price, trail_price)
+                        if direction_multiplier > 0
+                        else max(open_price, trail_price)
+                    )
+                    close_position(now, exit_price, "TRAILING_STOP")
+                    if daily_realized_points <= -max_daily_loss_points:
+                        daily_loss_halted = True
+                        counters["daily_loss_halts"] += 1
+                    continue
 
             if now.timetz().replace(tzinfo=None) >= SQUARE_OFF:
                 if position is not None and current is not None:
@@ -460,25 +593,39 @@ def replay_index_only(
                 break
 
             decision = signal_logic.EMATrendDecision()
-            if current is not None and current_timestamp != last_processed:
+            if (
+                current is not None
+                and current_index is not None
+                and current_timestamp is not None
+                and current_timestamp != last_processed
+            ):
                 context = None
                 if position is not None:
                     context = signal_logic.EMATrendPositionContext(
                         direction="LONG" if position["action"] == "ENTER_LONG" else "SHORT",
                         entry_underlying=position["entry_price"],
-                        stop_underlying=float(current.get("ema11", 0.0)),
+                        stop_underlying=float(current.get("ema9", 0.0)),
                     )
                 decision = engine.evaluate_candle(enriched.iloc[: current_index + 1], position=context)
                 last_processed = current_timestamp
                 if decision.signal_triggered:
                     counters["signals"] += 1
 
-            if position is not None:
+            if position is not None and current is not None:
                 if decision.action == "EXIT":
-                    close_position(now, float(current["close"]), decision.exit_reason or "EMA11_EXIT")
+                    close_position(now, float(current["close"]), decision.exit_reason or "EMA9_EXIT")
+                    if daily_realized_points <= -max_daily_loss_points:
+                        daily_loss_halted = True
+                        counters["daily_loss_halts"] += 1
+                elif is_new_bar and current_index is not None:
+                    update_trailing_stop(current_index)
                 continue
 
+            if daily_loss_halted or daily_realized_points <= -max_daily_loss_points:
+                continue
             if current is None or decision.action not in {"ENTER_LONG", "ENTER_SHORT"}:
+                continue
+            if current_index is None or current_timestamp is None:
                 continue
             close_time = current_timestamp + pd.Timedelta(minutes=5)
             age = now - close_time
@@ -489,11 +636,19 @@ def replay_index_only(
             )
             if not entry_allowed:
                 continue
+            entry_price = float(current["close"])
+            entry_stop_price = float(current.get("ema9", entry_price))
             position = {
                 "action": decision.action,
                 "signal_timestamp": current_timestamp,
                 "entry_timestamp": now,
-                "entry_price": float(current["close"]),
+                "entry_price": entry_price,
+                "entry_bar_index": current_index,
+                "trailing_stop_price": entry_stop_price,
+                "initial_risk": abs(entry_price - entry_stop_price),
+                "high_water": float(current["high"]),
+                "low_water": float(current["low"]),
+                "trailing_armed": False,
             }
             counters["entries"] += 1
 
@@ -509,10 +664,16 @@ def _report_index(
     start: date,
     end: date,
     poll_seconds: int,
+    max_daily_loss_points: float,
+    trailing_stop: str,
     history_cache: FyersHistoryCache,
 ) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"fyers_ema_{index_name.lower()}_index_replay_{start:%Y%m%d}_{end:%Y%m%d}"
+    trailing_suffix = f"_{trailing_stop}" if trailing_stop != "none" else ""
+    stem = (
+        f"fyers_ema_{index_name.lower()}_index_replay_"
+        f"{start:%Y%m%d}_{end:%Y%m%d}{trailing_suffix}"
+    )
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
     trades.to_csv(trades_path, index=False)
@@ -526,12 +687,18 @@ def _report_index(
         "Entry and exit prices are the index close available at the simulated decision; no option data is used.",
         f"Simulated poll interval: {poll_seconds}s.",
         "Results are directional index points, not rupee P&L; no lot multiplier, brokerage, or slippage is applied.",
-        "Daily max loss is not applied because its live setting is denominated in rupees.",
+        f"Daily loss cap: {max_daily_loss_points:.2f} directional index points, including realized "
+        "and open P&L; positions close at the cap level and entries stop for the day.",
+        "The cap is checked using completed five-minute index OHLC; a gap through the cap is filled "
+        "at that candle's open and can exceed the limit.",
+        f"Additional trailing stop: {trailing_stop}. Stops are checked on later completed bars and "
+        "only tighten. The existing EMA9 exit remains active.",
         f"Historical index cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         f"Signals: {counters['signals']}",
         f"Entries: {counters['entries']}",
         f"Exits: {counters['exits']}",
+        f"Daily loss halts: {counters['daily_loss_halts']}",
         f"Completed trades: {len(trades)}",
         f"Win rate: {(len(winners) / len(points) * 100.0) if len(points) else 0.0:.2f}%",
         f"Average winning points: {float(winners.mean()) if not winners.empty else 0.0:.2f}",
@@ -701,7 +868,7 @@ def replay(
                     context = signal_logic.EMATrendPositionContext(
                         direction=position.direction,
                         entry_underlying=position.entry_spot,
-                        stop_underlying=float(current.get("ema11", 0.0)),
+                        stop_underlying=float(current.get("ema9", 0.0)),
                     )
                 prefix = enriched.iloc[: current_index + 1]
                 decision = engine.evaluate_candle(prefix, position=context)
@@ -814,13 +981,13 @@ def _report(
     lines = [
         f"Live-process Fyers EMA replay: {start} through {end}",
         "Signals use the shared EMA logic on complete Fyers NIFTY five-minute bars.",
-        "Entry and EMA11 exit decisions use the option quote proxy at the same simulated poll; "
+        "Entry and EMA9 exit decisions use the option quote proxy at the same simulated poll; "
         "daily loss is checked on each poll. Quotes use the last completed option candle and are "
         "not guaranteed live fills.",
         f"Option candle resolution: {option_resolution}; simulated poll interval: {poll_seconds}s.",
         f"Historical candle cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
-        "Entry window, EMA11 exit, daily max-loss, and 15:15 square-off rules mirror the live runner.",
+        "Entry window, EMA9 exit, daily max-loss, and 15:15 square-off rules mirror the live runner.",
         "P&L is gross, matching the live alert calculation; fees and slippage are not included.",
         "Archived contracts use the current Fyers lot size because historical lot-size metadata "
         "is not supplied by the expired-symbol endpoint.",
@@ -861,7 +1028,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--lots", type=int, default=None)
     parser.add_argument("--max-daily-loss", type=float, default=None)
+    parser.add_argument(
+        "--max-daily-loss-points",
+        type=float,
+        default=170.0,
+        help="Index-only daily realized-plus-open loss cap in directional index points (default: 170).",
+    )
     parser.add_argument("--poll-seconds", type=int, default=None)
+    parser.add_argument(
+        "--trailing-stop",
+        choices=INDEX_TRAILING_STOPS,
+        default=None,
+        help=(
+            "Additional stop for index-only replay: none, swing_2bar, atr_2x, "
+            "breakeven_1r_ema9, or combined (index default: breakeven_1r_ema9)."
+        ),
+    )
     parser.add_argument("--option-resolution", choices=("auto", "5S", "1"), default="auto")
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument(
@@ -884,12 +1066,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Fetch candles from Fyers and replace matching cache entries.",
     )
     args = parser.parse_args(argv)
+    trailing_stop = args.trailing_stop
+    if trailing_stop is None:
+        trailing_stop = "breakeven_1r_ema9" if args.instrument == "index" else "none"
     try:
         start, end = date.fromisoformat(args.start_date), date.fromisoformat(args.end_date)
     except ValueError as exc:
         parser.error(str(exc))
     if start > end or (args.lots is not None and args.lots <= 0):
         parser.error("date range must be ordered and lots must be positive")
+    if not math.isfinite(args.max_daily_loss_points) or args.max_daily_loss_points <= 0:
+        parser.error("--max-daily-loss-points must be positive and finite.")
 
     load_dotenv(ENV_FILE, override=False)
     if args.use_cache is None:
@@ -982,8 +1169,20 @@ def main(argv: list[str] | None = None) -> int:
                 start=start,
                 end=end,
                 poll_seconds=poll_seconds,
+                max_daily_loss_points=args.max_daily_loss_points,
+                trailing_stop=trailing_stop,
             )
-            _report_index(trades, counters, index_name, start, end, poll_seconds, history_cache)
+            _report_index(
+                trades,
+                counters,
+                index_name,
+                start,
+                end,
+                poll_seconds,
+                args.max_daily_loss_points,
+                trailing_stop,
+                history_cache,
+            )
             return 0
 
         active_rows = api.option_master()

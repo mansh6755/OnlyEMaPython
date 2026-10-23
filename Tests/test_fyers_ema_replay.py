@@ -49,7 +49,7 @@ class _FakeLogic:
             if position is None and timestamp == pd.Timestamp("2026-10-15T09:25:00+05:30"):
                 return _FakeLogic.EMATrendDecision("ENTER_LONG", signal_triggered=True)
             if position is not None and timestamp == pd.Timestamp("2026-10-15T09:30:00+05:30"):
-                return _FakeLogic.EMATrendDecision("EXIT", exit_reason="EMA11_EXIT")
+                return _FakeLogic.EMATrendDecision("EXIT", exit_reason="EMA9_EXIT")
             return _FakeLogic.EMATrendDecision()
 
     @staticmethod
@@ -235,8 +235,142 @@ def test_index_only_replay_reports_directional_points_without_option_data():
     assert trades.iloc[0]["entry_index"] == 101.0
     assert trades.iloc[0]["exit_index"] == 102.0
     assert trades.iloc[0]["index_points"] == 1.0
-    assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
-    assert counters == {"signals": 1, "entries": 1, "exits": 1}
+    assert trades.iloc[0]["exit_reason"] == "EMA9_EXIT"
+    assert counters == {"signals": 1, "entries": 1, "exits": 1, "daily_loss_halts": 0}
+
+
+def test_index_only_daily_loss_cap_closes_position_and_blocks_day_entries():
+    class LossCapLogic(_FakeLogic):
+        class EMATrendSignalEngine:
+            def __init__(self, _config):
+                pass
+
+            def evaluate_candle(self, candles, position=None):
+                timestamp = pd.Timestamp(candles.iloc[-1]["timestamp"])
+                if position is None and timestamp in {
+                    pd.Timestamp("2026-10-15T09:25:00+05:30"),
+                    pd.Timestamp("2026-10-15T09:35:00+05:30"),
+                }:
+                    return _FakeLogic.EMATrendDecision("ENTER_LONG", signal_triggered=True)
+                return _FakeLogic.EMATrendDecision()
+
+    timestamps = pd.date_range("2026-10-15T09:15:00+05:30", periods=7, freq="5min")
+    closes = [22000.0, 22000.0, 22000.0, 22000.0, 22000.0, 22000.0, 22000.0]
+    opens = closes.copy()
+    highs = [value + 5 for value in closes]
+    lows = [value - 5 for value in closes]
+    closes[3] = 21820.0
+    opens[3] = 22000.0
+    lows[3] = 21800.0
+    index_bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [5.0] * len(timestamps),
+        }
+    )
+
+    trades, counters = replay_index_only(
+        signal_logic=LossCapLogic,
+        strategy_config=None,
+        index_bars=index_bars,
+        start=date(2026, 10, 15),
+        end=date(2026, 10, 15),
+        poll_seconds=30,
+        max_daily_loss_points=170,
+    )
+
+    assert len(trades) == 1
+    assert trades.iloc[0]["exit_reason"] == "DAILY_MAX_LOSS"
+    assert trades.iloc[0]["index_points"] == -170
+    assert counters == {"signals": 2, "entries": 1, "exits": 1, "daily_loss_halts": 1}
+
+
+def test_index_only_daily_loss_cap_must_be_positive_and_finite():
+    bars = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-10-15T09:15:00+05:30", periods=1, freq="5min"),
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [5.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="max_daily_loss_points must be positive and finite"):
+        replay_index_only(
+            signal_logic=_FakeLogic,
+            strategy_config=None,
+            index_bars=bars,
+            start=date(2026, 10, 15),
+            end=date(2026, 10, 15),
+            max_daily_loss_points=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("trailing_stop", "expected_exit"),
+    [
+        ("swing_2bar", 980.0),
+        ("atr_2x", 1080.0),
+        ("breakeven_1r_ema9", 1000.0),
+        ("combined", 1080.0),
+    ],
+)
+def test_index_only_trailing_stops_tighten_and_exit_on_a_later_bar(trailing_stop, expected_exit):
+    class SwingTrailLogic(_FakeLogic):
+        class EMATrendSignalEngine:
+            def __init__(self, _config):
+                pass
+
+            def evaluate_candle(self, candles, position=None):
+                if (
+                    position is None
+                    and pd.Timestamp(candles.iloc[-1]["timestamp"])
+                    == pd.Timestamp("2026-10-15T09:20:00+05:30")
+                ):
+                    return _FakeLogic.EMATrendDecision("ENTER_LONG", signal_triggered=True)
+                return _FakeLogic.EMATrendDecision()
+
+        @staticmethod
+        def build_ema_trend_with_indicators(bars, _config):
+            frame = bars.copy()
+            frame["ema9"] = 900.0
+            frame["atr"] = 20.0
+            return frame
+
+    timestamps = pd.date_range("2026-10-15T09:15:00+05:30", periods=5, freq="5min")
+    bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [1000.0, 1000.0, 1000.0, 1100.0, 990.0],
+            "high": [1010.0, 1010.0, 1120.0, 1120.0, 1000.0],
+            "low": [990.0, 990.0, 980.0, 975.0, 980.0],
+            "close": [1000.0, 1000.0, 1040.0, 995.0, 990.0],
+            "volume": [5.0] * len(timestamps),
+        }
+    )
+
+    trades, counters = replay_index_only(
+        signal_logic=SwingTrailLogic,
+        strategy_config=None,
+        index_bars=bars,
+        start=date(2026, 10, 15),
+        end=date(2026, 10, 15),
+        poll_seconds=30,
+        trailing_stop=trailing_stop,
+    )
+
+    assert len(trades) == 1
+    assert trades.iloc[0]["exit_reason"] == "TRAILING_STOP"
+    assert trades.iloc[0]["exit_index"] == expected_exit
+    assert trades.iloc[0]["index_points"] == expected_exit - 1000.0
+    assert trades.iloc[0]["exit_time"] == "2026-10-15T09:35:00+05:30"
+    assert counters["exits"] == 1
 
 
 def test_history_cache_refresh_replaces_cached_candles(tmp_path):
@@ -337,7 +471,7 @@ def test_replay_uses_live_poll_timing_and_option_prices_for_trade_pnl():
     assert trades.iloc[0]["exit_option"] == 110.0
     assert trades.iloc[0]["quantity"] == 65
     assert trades.iloc[0]["gross_pnl"] == 650.0
-    assert trades.iloc[0]["exit_reason"] == "EMA11_EXIT"
+    assert trades.iloc[0]["exit_reason"] == "EMA9_EXIT"
     assert api.requests[0][0] == "NSE:NIFTY26O2022500CE"
 
 

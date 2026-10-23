@@ -287,7 +287,7 @@ def replay_index_signals(
             position_context = signal_logic.EMATrendPositionContext(
                 direction=position.direction,
                 entry_underlying=position.entry_index_price,
-                stop_underlying=float(candle.get("ema11", 0.0)),
+                stop_underlying=float(candle.get("ema9", 0.0)),
             )
         decision = engine.evaluate_candle(enriched.iloc[: index + 1], position=position_context)
         if (trade_start is not None and day < trade_start) or (trade_end is not None and day > trade_end):

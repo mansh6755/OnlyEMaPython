@@ -23,10 +23,10 @@ Strategy summary from the brief:
 3. Entries also require EMA ordering, ATR distance, EMA slope thresholds,
    slope-strength comparison, EMA11 slope expansion, ADX confirmation,
    and a full-bodied entry candle.
-4. Exit is dynamic: if price crosses EMA11 at any point inside the candle,
+4. Exit is dynamic: if price crosses EMA9 at any point inside the candle,
    exit the trade. In OHLC terms:
-   - long exit when candle low goes below EMA11
-   - short exit when candle high goes above EMA11
+   - long exit when candle low goes below EMA9
+   - short exit when candle high goes above EMA9
 
 Beginner mental model:
 - `build_ema_trend_with_indicators()` prepares all the numbers.
@@ -115,7 +115,7 @@ class EMATrendPositionContext:
     Minimal snapshot of an already-open trade.
 
     `stop_underlying` is optional because this strategy exits on the current
-    EMA11 value, not on a fixed static stop price.
+    EMA9 value, not on a fixed static stop price.
     """
 
     direction: str
@@ -227,7 +227,7 @@ def build_ema_trend_with_indicators(
 
     Output columns added:
     - timestamp
-    - ema4, ema11, ema18
+    - ema4, ema9, ema11, ema18
     - atr
     - adx
     - candle_body, candle_range, candle_body_ratio, full_body_candle
@@ -274,6 +274,7 @@ def build_ema_trend_with_indicators(
     high_values = np.asarray(high, dtype=np.float64)
     low_values = np.asarray(low, dtype=np.float64)
     frame["ema4"] = talib.EMA(close_values, timeperiod=config.ema_fast_period)
+    frame["ema9"] = talib.EMA(close_values, timeperiod=9)
     frame["ema11"] = talib.EMA(close_values, timeperiod=config.ema_mid_period)
     frame["ema18"] = talib.EMA(close_values, timeperiod=config.ema_slow_period)
     frame["atr"] = talib.ATR(
@@ -326,12 +327,12 @@ def build_ema_trend_with_indicators(
     #
     # Important:
     # Exit here is not close-based anymore. It is range-based:
-    # - long_exit becomes True if the candle traded below EMA11 at any point
-    # - short_exit becomes True if the candle traded above EMA11 at any point
+    # - long_exit becomes True if the candle traded below EMA9 at any point
+    # - short_exit becomes True if the candle traded above EMA9 at any point
     frame["long_setup"] = _build_long_setup(frame, config)
     frame["short_setup"] = _build_short_setup(frame, config)
-    frame["long_exit"] = frame["low"] < frame["ema11"]
-    frame["short_exit"] = frame["high"] > frame["ema11"]
+    frame["long_exit"] = frame["low"] < frame["ema9"]
+    frame["short_exit"] = frame["high"] > frame["ema9"]
     return frame
 
 
@@ -380,26 +381,26 @@ class EMATrendSignalEngine:
         current_candle: pd.Series,
     ) -> EMATrendDecision:
         """
-        Exit an open trade when the candle range crosses EMA11 against the trade.
+        Exit an open trade when the candle range crosses EMA9 against the trade.
 
         Why this uses `low` and `high`:
         - The user asked not to wait for candle close confirmation.
-        - With OHLC candles, the best available proxy for "price crossed EMA11
+        - With OHLC candles, the best available proxy for "price crossed EMA9
           at any point during the candle" is:
-          - `low < ema11` for long exits
-          - `high > ema11` for short exits
+          - `low < ema9` for long exits
+          - `high > ema9` for short exits
         """
         direction = self._normalize_direction(position.direction)
         high = float(current_candle["high"])
         low = float(current_candle["low"])
-        ema11 = float(current_candle["ema11"])
+        ema9 = float(current_candle["ema9"])
 
-        # This is a range-based EMA11 breach check, not a close-based check.
-        if direction == "LONG" and low < ema11:
-            return EMATrendDecision(action="EXIT", exit_reason="EMA11_EXIT")
+        # This is a range-based EMA9 breach check, not a close-based check.
+        if direction == "LONG" and low < ema9:
+            return EMATrendDecision(action="EXIT", exit_reason="EMA9_EXIT")
 
-        if direction == "SHORT" and high > ema11:
-            return EMATrendDecision(action="EXIT", exit_reason="EMA11_EXIT")
+        if direction == "SHORT" and high > ema9:
+            return EMATrendDecision(action="EXIT", exit_reason="EMA9_EXIT")
 
         return self._hold()
 
@@ -416,13 +417,14 @@ class EMATrendSignalEngine:
           including the full-bodied-candle filter.
         - Short: close below all EMAs plus all bearish filters from the brief,
           including the full-bodied-candle filter.
-        - Exit: candle range breaches EMA11 against the active trade direction.
+        - Exit: candle range breaches EMA9 against the active trade direction.
         """
         required_columns = [
             "high",
             "low",
             "close",
             "ema4",
+            "ema9",
             "ema11",
             "ema18",
             "atr",
@@ -456,6 +458,7 @@ class EMATrendSignalEngine:
                 current["low"],
                 current["close"],
                 current["ema4"],
+                current["ema9"],
                 current["ema11"],
                 current["ema18"],
                 current["atr"],
@@ -478,17 +481,17 @@ class EMATrendSignalEngine:
             return self._evaluate_exit(position, current)
 
         close = float(current["close"])
-        ema11 = float(current["ema11"])
+        ema9 = float(current["ema9"])
 
         # Flat-state branch:
         # If the latest candle satisfies the full bullish/bearish setup, the
-        # engine returns an entry decision and includes the current EMA11 value
+        # engine returns an entry decision and includes the current EMA9 value
         # as a helpful reference stop for logging and downstream systems.
         if bool(current["long_setup"]):
             return EMATrendDecision(
                 action="ENTER_LONG",
                 entry_underlying=close,
-                stop_underlying=ema11,
+                stop_underlying=ema9,
                 signal_triggered=True,
             )
 
@@ -496,7 +499,7 @@ class EMATrendSignalEngine:
             return EMATrendDecision(
                 action="ENTER_SHORT",
                 entry_underlying=close,
-                stop_underlying=ema11,
+                stop_underlying=ema9,
                 signal_triggered=True,
             )
 

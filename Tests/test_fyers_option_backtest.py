@@ -42,7 +42,7 @@ class _FakeLogic:
             if position is None and self.calls == 2:
                 return SimpleNamespace(action="ENTER_LONG", signal_triggered=True, stop_underlying=23950)
             if position is not None and self.calls == 3:
-                return SimpleNamespace(action="EXIT", exit_reason="EMA11_EXIT", signal_triggered=False)
+                return SimpleNamespace(action="EXIT", exit_reason="EMA9_EXIT", signal_triggered=False)
             return SimpleNamespace(action="HOLD", signal_triggered=False, exit_reason="")
 
     @staticmethod

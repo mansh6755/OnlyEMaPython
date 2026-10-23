@@ -21,7 +21,7 @@ broker diagnostics remain separate utilities; they are not used by this EMA runn
 replays the live EMA process without using the legacy backtest scripts. It uses
 the shared EMA signal logic on complete NIFTY five-minute candles, then uses
 historical candles for the selected Fyers option contract to estimate the
-paper-run quote without looking beyond the simulated action time. Entry/EMA11
+paper-run quote without looking beyond the simulated action time. Entry/EMA9
 exit actions use the quote at the simulated decision poll, and daily loss is
 checked on each poll. The `EMA_MAX_LOSS` threshold (default ₹5,500) is per
 trading day and includes realized P&L plus the open position's estimated P&L;
@@ -44,9 +44,21 @@ history instead. This mode uses the same completed five-minute signal rules and 
 directional index points per trade; it does not fetch option contracts or
 premiums. Entry and exit prices use the index close available at the simulated
 decision. Results are not rupee P&L, and no lot multiplier, fees, slippage, or
-rupee-denominated daily max-loss rule is applied. Index history is requested
-one calendar day at a time to avoid Fyers range-request failures. SENSEX index
-testing is index-only; the options replay remains NIFTY-only.
+rupee-denominated daily max-loss rule is applied. Index-only replay defaults to
+a separate 170-point daily loss cap (`--max-daily-loss-points`); it counts
+realized plus open directional points, closes at the cap level when the
+completed five-minute candle reaches it (using the candle open if it gaps past
+the cap), and blocks entries for the rest of that day. Index history is
+requested one calendar day at a time to avoid Fyers range-request failures.
+SENSEX index testing is index-only; the options replay remains NIFTY-only.
+An index-only trailing stop can be selected with `--trailing-stop`:
+`swing_2bar`, `atr_2x`, `breakeven_1r_ema9`, or `combined`. The default is
+`breakeven_1r_ema9`; pass `--trailing-stop none` to disable it. This default
+had the strongest net points among the compared modes in the January–October
+22, 2026 NIFTY replay; this is an in-sample historical result, not a guarantee.
+The EMA9 exit and 170-point daily cap remain active in all modes.
+Trailing levels tighten after a completed bar and are applied to subsequent
+bars to avoid using that bar's high/low before the stop was established.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
