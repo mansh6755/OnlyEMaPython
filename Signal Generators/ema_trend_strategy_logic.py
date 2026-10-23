@@ -57,6 +57,7 @@ class EMATrendConfig:
     ema11_slope_atr_multiplier: float = 0.3
     ema18_slope_atr_multiplier: float = 0.2
     full_body_min_ratio: float = 0.5
+    exit_ema_period: int = 9
 
     def __post_init__(self) -> None:
         invalid_finite = [
@@ -91,6 +92,8 @@ class EMATrendConfig:
             < int(self.ema_slow_period)
         ):
             raise ValueError("Require ema_fast_period < ema_mid_period < ema_slow_period.")
+        if int(self.exit_ema_period) not in {9, 11}:
+            raise ValueError("`exit_ema_period` must be 9 or 11.")
         non_negative = {
             "adx_threshold": self.adx_threshold,
             "distance_atr_multiplier": self.distance_atr_multiplier,
@@ -326,13 +329,12 @@ def build_ema_trend_with_indicators(
     # directly to see whether the latest candle is a valid setup or exit.
     #
     # Important:
-    # Exit here is not close-based anymore. It is range-based:
-    # - long_exit becomes True if the candle traded below EMA9 at any point
-    # - short_exit becomes True if the candle traded above EMA9 at any point
+    # Exit is range-based and uses the configured exit EMA.
     frame["long_setup"] = _build_long_setup(frame, config)
     frame["short_setup"] = _build_short_setup(frame, config)
-    frame["long_exit"] = frame["low"] < frame["ema9"]
-    frame["short_exit"] = frame["high"] > frame["ema9"]
+    exit_ema = frame[f"ema{config.exit_ema_period}"]
+    frame["long_exit"] = frame["low"] < exit_ema
+    frame["short_exit"] = frame["high"] > exit_ema
     return frame
 
 
@@ -381,11 +383,12 @@ class EMATrendSignalEngine:
         current_candle: pd.Series,
     ) -> EMATrendDecision:
         """
-        Exit an open trade when the candle range crosses EMA9 against the trade.
+        Exit an open trade when the candle range crosses the configured EMA
+        against the trade.
 
         Why this uses `low` and `high`:
         - The user asked not to wait for candle close confirmation.
-        - With OHLC candles, the best available proxy for "price crossed EMA9
+        - With OHLC candles, the best available proxy for "price crossed the EMA
           at any point during the candle" is:
           - `low < ema9` for long exits
           - `high > ema9` for short exits
@@ -393,14 +396,15 @@ class EMATrendSignalEngine:
         direction = self._normalize_direction(position.direction)
         high = float(current_candle["high"])
         low = float(current_candle["low"])
-        ema9 = float(current_candle["ema9"])
+        exit_ema_name = f"ema{self.config.exit_ema_period}"
+        exit_ema = float(current_candle[exit_ema_name])
+        exit_reason = f"EMA{self.config.exit_ema_period}_EXIT"
 
-        # This is a range-based EMA9 breach check, not a close-based check.
-        if direction == "LONG" and low < ema9:
-            return EMATrendDecision(action="EXIT", exit_reason="EMA9_EXIT")
+        if direction == "LONG" and low < exit_ema:
+            return EMATrendDecision(action="EXIT", exit_reason=exit_reason)
 
-        if direction == "SHORT" and high > ema9:
-            return EMATrendDecision(action="EXIT", exit_reason="EMA9_EXIT")
+        if direction == "SHORT" and high > exit_ema:
+            return EMATrendDecision(action="EXIT", exit_reason=exit_reason)
 
         return self._hold()
 
@@ -417,7 +421,8 @@ class EMATrendSignalEngine:
           including the full-bodied-candle filter.
         - Short: close below all EMAs plus all bearish filters from the brief,
           including the full-bodied-candle filter.
-        - Exit: candle range breaches EMA9 against the active trade direction.
+        - Exit: candle range breaches the configured exit EMA against the active
+          trade direction.
         """
         required_columns = [
             "high",
@@ -481,7 +486,7 @@ class EMATrendSignalEngine:
             return self._evaluate_exit(position, current)
 
         close = float(current["close"])
-        ema9 = float(current["ema9"])
+        exit_ema = float(current[f"ema{self.config.exit_ema_period}"])
 
         # Flat-state branch:
         # If the latest candle satisfies the full bullish/bearish setup, the
@@ -491,7 +496,7 @@ class EMATrendSignalEngine:
             return EMATrendDecision(
                 action="ENTER_LONG",
                 entry_underlying=close,
-                stop_underlying=ema9,
+                stop_underlying=exit_ema,
                 signal_triggered=True,
             )
 
@@ -499,7 +504,7 @@ class EMATrendSignalEngine:
             return EMATrendDecision(
                 action="ENTER_SHORT",
                 entry_underlying=close,
-                stop_underlying=ema9,
+                stop_underlying=exit_ema,
                 signal_triggered=True,
             )
 

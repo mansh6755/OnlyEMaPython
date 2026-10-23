@@ -44,6 +44,8 @@ The commands:
       python algo.py fyers-backtest --instrument index --start-date 2026-10-15 --end-date 2026-10-15
       Index-only mode applies a 170-point daily loss cap by default; override it with
       --max-daily-loss-points <points>.
+      Use --exit-ema 11 to test EMA11 exits without changing entry signals; it is
+      available only for index-only replay.
       Use --index sensex to replay SENSEX instead:
       python algo.py fyers-backtest --instrument index --index sensex --start-date 2026-10-15 --end-date 2026-10-15
 

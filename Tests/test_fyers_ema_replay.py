@@ -8,6 +8,7 @@ from Dependencies.fyers_ema_replay import (
     FyersHistoryCache,
     _action_polls,
     _expiry_lookup_end,
+    _index_history_warmup_start,
     _parse_cache_flag,
     _quote_at,
     replay,
@@ -84,6 +85,14 @@ def test_poll_schedule_includes_the_first_poll_after_square_off():
 def test_expiry_lookup_includes_the_following_week_after_the_replay_end():
     assert _expiry_lookup_end(date(2026, 2, 28), date(2026, 10, 15)) == date(2026, 3, 7)
     assert _expiry_lookup_end(date(2026, 10, 15), date(2026, 10, 15)) == date(2026, 10, 14)
+
+
+def test_index_history_warmup_stays_inside_the_one_year_intraday_window():
+    today = date(2026, 10, 23)
+
+    assert _index_history_warmup_start(date(2025, 10, 23), today) == date(2025, 10, 23)
+    assert _index_history_warmup_start(date(2025, 10, 30), today) == date(2025, 10, 23)
+    assert _index_history_warmup_start(date(2025, 10, 22), today) == date(2025, 10, 15)
 
 
 def test_use_cache_flag_accepts_true_or_false_values():
@@ -239,7 +248,10 @@ def test_index_only_replay_reports_directional_points_without_option_data():
     assert counters == {"signals": 1, "entries": 1, "exits": 1, "daily_loss_halts": 0}
 
 
-def test_index_only_daily_loss_cap_closes_position_and_blocks_day_entries():
+@pytest.mark.parametrize(("max_daily_loss_points", "expected_loss"), [(130, -130), (None, -170)])
+def test_index_only_daily_loss_cap_closes_position_and_blocks_day_entries(
+    max_daily_loss_points, expected_loss
+):
     class LossCapLogic(_FakeLogic):
         class EMATrendSignalEngine:
             def __init__(self, _config):
@@ -273,6 +285,11 @@ def test_index_only_daily_loss_cap_closes_position_and_blocks_day_entries():
         }
     )
 
+    replay_options = (
+        {"max_daily_loss_points": max_daily_loss_points}
+        if max_daily_loss_points is not None
+        else {}
+    )
     trades, counters = replay_index_only(
         signal_logic=LossCapLogic,
         strategy_config=None,
@@ -280,12 +297,12 @@ def test_index_only_daily_loss_cap_closes_position_and_blocks_day_entries():
         start=date(2026, 10, 15),
         end=date(2026, 10, 15),
         poll_seconds=30,
-        max_daily_loss_points=170,
+        **replay_options,
     )
 
     assert len(trades) == 1
     assert trades.iloc[0]["exit_reason"] == "DAILY_MAX_LOSS"
-    assert trades.iloc[0]["index_points"] == -170
+    assert trades.iloc[0]["index_points"] == expected_loss
     assert counters == {"signals": 2, "entries": 1, "exits": 1, "daily_loss_halts": 1}
 
 
@@ -318,6 +335,7 @@ def test_index_only_daily_loss_cap_must_be_positive_and_finite():
         ("swing_2bar", 980.0),
         ("atr_2x", 1080.0),
         ("breakeven_1r_ema9", 1000.0),
+        ("breakeven_1r_ema11", 1060.0),
         ("combined", 1080.0),
     ],
 )
@@ -340,6 +358,7 @@ def test_index_only_trailing_stops_tighten_and_exit_on_a_later_bar(trailing_stop
         def build_ema_trend_with_indicators(bars, _config):
             frame = bars.copy()
             frame["ema9"] = 900.0
+            frame["ema11"] = [950.0, 950.0, 1060.0, 1070.0, 1080.0]
             frame["atr"] = 20.0
             return frame
 
@@ -371,6 +390,54 @@ def test_index_only_trailing_stops_tighten_and_exit_on_a_later_bar(trailing_stop
     assert trades.iloc[0]["index_points"] == expected_exit - 1000.0
     assert trades.iloc[0]["exit_time"] == "2026-10-15T09:35:00+05:30"
     assert counters["exits"] == 1
+
+
+def test_index_only_breakeven_trail_ignores_entry_bar_high_before_entry():
+    class EntryBarHighLogic(_FakeLogic):
+        class EMATrendSignalEngine:
+            def __init__(self, _config):
+                pass
+
+            def evaluate_candle(self, candles, position=None):
+                if (
+                    position is None
+                    and pd.Timestamp(candles.iloc[-1]["timestamp"])
+                    == pd.Timestamp("2026-10-15T09:20:00+05:30")
+                ):
+                    return _FakeLogic.EMATrendDecision("ENTER_LONG", signal_triggered=True)
+                return _FakeLogic.EMATrendDecision()
+
+        @staticmethod
+        def build_ema_trend_with_indicators(bars, _config):
+            frame = bars.copy()
+            frame["ema9"] = [990.0, 990.0, 1004.0, 1008.0]
+            frame["atr"] = 20.0
+            return frame
+
+    timestamps = pd.date_range("2026-10-15T09:15:00+05:30", periods=4, freq="5min")
+    bars = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [1000.0, 1000.0, 1000.0, 1002.0],
+            "high": [1005.0, 1050.0, 1005.0, 1009.0],
+            "low": [995.0, 995.0, 995.0, 1000.0],
+            "close": [1000.0, 1000.0, 1002.0, 1005.0],
+            "volume": [5.0] * len(timestamps),
+        }
+    )
+
+    trades, _ = replay_index_only(
+        signal_logic=EntryBarHighLogic,
+        strategy_config=None,
+        index_bars=bars,
+        start=date(2026, 10, 15),
+        end=date(2026, 10, 15),
+        poll_seconds=30,
+        trailing_stop="breakeven_1r_ema9",
+    )
+
+    assert len(trades) == 1
+    assert trades.iloc[0]["exit_reason"] == "SQUARE_OFF"
 
 
 def test_history_cache_refresh_replaces_cached_candles(tmp_path):

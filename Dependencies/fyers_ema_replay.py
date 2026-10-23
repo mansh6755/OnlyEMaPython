@@ -48,7 +48,14 @@ SQUARE_OFF = time(15, 15)
 MAX_ENTRY_BAR_AGE = timedelta(minutes=2)
 HISTORY_CHUNK_DAYS = 90
 OPTION_RESOLUTION_SECONDS = {"5S": 5, "1": 60}
-INDEX_TRAILING_STOPS = ("none", "swing_2bar", "atr_2x", "breakeven_1r_ema9", "combined")
+INDEX_TRAILING_STOPS = (
+    "none",
+    "swing_2bar",
+    "atr_2x",
+    "breakeven_1r_ema9",
+    "breakeven_1r_ema11",
+    "combined",
+)
 HISTORY_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 CACHE_VERSION = 1
 
@@ -80,6 +87,14 @@ class _Position:
     entry_spot: float
     entry_option: float
     option_quotes: _OptionQuotes
+
+
+def _index_history_warmup_start(start: date, today: date) -> date:
+    warmup_start = start - timedelta(days=7)
+    intraday_history_start = today - timedelta(days=365)
+    if start >= intraday_history_start:
+        return max(warmup_start, intraday_history_start)
+    return warmup_start
 
 
 def _load_signal_logic() -> Any:
@@ -428,6 +443,8 @@ def replay_index_only(
     daily_realized_points = 0.0
     if trailing_stop != "none":
         required_trailing_columns = {"ema9", "atr"}
+        if trailing_stop == "breakeven_1r_ema11":
+            required_trailing_columns.add("ema11")
         missing_trailing_columns = required_trailing_columns.difference(enriched.columns)
         if missing_trailing_columns:
             raise ValueError(
@@ -498,11 +515,12 @@ def replay_index_only(
                 )
                 candidates.append(chandelier)
 
-        if trailing_stop in {"breakeven_1r_ema9", "combined"} and armed_now:
+        if trailing_stop in {"breakeven_1r_ema9", "breakeven_1r_ema11", "combined"} and armed_now:
             candidates.append(position["entry_price"])
-            ema9 = float(current_bar["ema9"])
-            if math.isfinite(ema9):
-                candidates.append(ema9)
+            trailing_ema = "ema11" if trailing_stop == "breakeven_1r_ema11" else "ema9"
+            ema_value = float(current_bar[trailing_ema])
+            if math.isfinite(ema_value):
+                candidates.append(ema_value)
 
         tightened = max(candidates) if is_long else min(candidates)
         position["trailing_stop_price"] = tightened
@@ -637,7 +655,8 @@ def replay_index_only(
             if not entry_allowed:
                 continue
             entry_price = float(current["close"])
-            entry_stop_price = float(current.get("ema9", entry_price))
+            initial_stop_ema = "ema11" if trailing_stop == "breakeven_1r_ema11" else "ema9"
+            entry_stop_price = float(current.get(initial_stop_ema, entry_price))
             position = {
                 "action": decision.action,
                 "signal_timestamp": current_timestamp,
@@ -646,8 +665,8 @@ def replay_index_only(
                 "entry_bar_index": current_index,
                 "trailing_stop_price": entry_stop_price,
                 "initial_risk": abs(entry_price - entry_stop_price),
-                "high_water": float(current["high"]),
-                "low_water": float(current["low"]),
+                "high_water": entry_price,
+                "low_water": entry_price,
                 "trailing_armed": False,
             }
             counters["entries"] += 1
@@ -666,13 +685,15 @@ def _report_index(
     poll_seconds: int,
     max_daily_loss_points: float,
     trailing_stop: str,
+    exit_ema_period: int,
     history_cache: FyersHistoryCache,
 ) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     trailing_suffix = f"_{trailing_stop}" if trailing_stop != "none" else ""
+    exit_ema_suffix = f"_exit_ema{exit_ema_period}" if exit_ema_period != 9 else ""
     stem = (
         f"fyers_ema_{index_name.lower()}_index_replay_"
-        f"{start:%Y%m%d}_{end:%Y%m%d}{trailing_suffix}"
+        f"{start:%Y%m%d}_{end:%Y%m%d}{trailing_suffix}{exit_ema_suffix}"
     )
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
@@ -692,7 +713,7 @@ def _report_index(
         "The cap is checked using completed five-minute index OHLC; a gap through the cap is filled "
         "at that candle's open and can exceed the limit.",
         f"Additional trailing stop: {trailing_stop}. Stops are checked on later completed bars and "
-        "only tighten. The existing EMA9 exit remains active.",
+        f"only tighten. The strategy exit uses EMA{exit_ema_period}.",
         f"Historical index cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         f"Signals: {counters['signals']}",
@@ -1041,8 +1062,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Additional stop for index-only replay: none, swing_2bar, atr_2x, "
-            "breakeven_1r_ema9, or combined (index default: breakeven_1r_ema9)."
+            "breakeven_1r_ema9, breakeven_1r_ema11, or combined "
+            "(index default: breakeven_1r_ema9)."
         ),
+    )
+    parser.add_argument(
+        "--exit-ema",
+        choices=(9, 11),
+        type=int,
+        default=9,
+        help="EMA period for the normal strategy exit in index-only replay (default: 9).",
     )
     parser.add_argument("--option-resolution", choices=("auto", "5S", "1"), default="auto")
     cache_group = parser.add_mutually_exclusive_group()
@@ -1111,6 +1140,8 @@ def main(argv: list[str] | None = None) -> int:
     if poll_seconds <= 0 or poll_seconds > 120:
         parser.error("poll-seconds must be between 1 and 120.")
     if args.instrument == "options":
+        if args.exit_ema != 9:
+            parser.error("--exit-ema 11 is supported only with --instrument index.")
         if args.index != "nifty":
             parser.error("--index sensex is only supported with --instrument index.")
         if lots <= 0 or not math.isfinite(max_daily_loss) or max_daily_loss <= 0:
@@ -1140,6 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
         distance_atr_multiplier=0.5,
         ema11_slope_atr_multiplier=0.3,
         ema18_slope_atr_multiplier=0.2,
+        exit_ema_period=args.exit_ema,
     )
     api = FyersAPI(app_id, access_token)
     history_cache = FyersHistoryCache(
@@ -1151,7 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
         index_name, index_symbol = INDEX_SYMBOLS[args.index]
         raw_index = _fetch_index_history(
             api,
-            start - timedelta(days=7),
+            _index_history_warmup_start(start, date.today()),
             end,
             history_cache,
             symbol=index_symbol,
@@ -1181,6 +1213,7 @@ def main(argv: list[str] | None = None) -> int:
                 poll_seconds,
                 args.max_daily_loss_points,
                 trailing_stop,
+                args.exit_ema,
                 history_cache,
             )
             return 0
