@@ -23,10 +23,9 @@ Strategy summary from the brief:
 3. Entries also require EMA ordering, ATR distance, EMA slope thresholds,
    slope-strength comparison, EMA11 slope expansion, ADX confirmation,
    and a full-bodied entry candle.
-4. Exit is dynamic: if price crosses EMA9 at any point inside the candle,
-   exit the trade. In OHLC terms:
-   - long exit when candle low goes below EMA9
-   - short exit when candle high goes above EMA9
+4. Exit is confirmed at candle close:
+   - long exit when candle closes below the selected exit EMA
+   - short exit when candle closes above the selected exit EMA
 
 Beginner mental model:
 - `build_ema_trend_with_indicators()` prepares all the numbers.
@@ -328,13 +327,12 @@ def build_ema_trend_with_indicators(
     # Instead of manually recomputing conditions, a caller can inspect these
     # directly to see whether the latest candle is a valid setup or exit.
     #
-    # Important:
-    # Exit is range-based and uses the configured exit EMA.
+    # Exit is confirmed by the completed candle close against the configured EMA.
     frame["long_setup"] = _build_long_setup(frame, config)
     frame["short_setup"] = _build_short_setup(frame, config)
     exit_ema = frame[f"ema{config.exit_ema_period}"]
-    frame["long_exit"] = frame["low"] < exit_ema
-    frame["short_exit"] = frame["high"] > exit_ema
+    frame["long_exit"] = frame["close"] < exit_ema
+    frame["short_exit"] = frame["close"] > exit_ema
     return frame
 
 
@@ -383,27 +381,21 @@ class EMATrendSignalEngine:
         current_candle: pd.Series,
     ) -> EMATrendDecision:
         """
-        Exit an open trade when the candle range crosses the configured EMA
-        against the trade.
+        Exit an open trade when a completed candle closes across the configured EMA.
 
-        Why this uses `low` and `high`:
-        - The user asked not to wait for candle close confirmation.
-        - With OHLC candles, the best available proxy for "price crossed the EMA
-          at any point during the candle" is:
-          - `low < ema9` for long exits
-          - `high > ema9` for short exits
+        The caller evaluates this only after the candle has completed, so wick
+        touches without a close across the EMA do not exit the position.
         """
         direction = self._normalize_direction(position.direction)
-        high = float(current_candle["high"])
-        low = float(current_candle["low"])
+        close = float(current_candle["close"])
         exit_ema_name = f"ema{self.config.exit_ema_period}"
         exit_ema = float(current_candle[exit_ema_name])
         exit_reason = f"EMA{self.config.exit_ema_period}_EXIT"
 
-        if direction == "LONG" and low < exit_ema:
+        if direction == "LONG" and close < exit_ema:
             return EMATrendDecision(action="EXIT", exit_reason=exit_reason)
 
-        if direction == "SHORT" and high > exit_ema:
+        if direction == "SHORT" and close > exit_ema:
             return EMATrendDecision(action="EXIT", exit_reason=exit_reason)
 
         return self._hold()
@@ -421,8 +413,8 @@ class EMATrendSignalEngine:
           including the full-bodied-candle filter.
         - Short: close below all EMAs plus all bearish filters from the brief,
           including the full-bodied-candle filter.
-        - Exit: candle range breaches the configured exit EMA against the active
-          trade direction.
+        - Exit: completed candle closes across the configured exit EMA against
+          the active trade direction.
         """
         required_columns = [
             "high",

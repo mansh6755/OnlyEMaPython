@@ -551,55 +551,21 @@ def replay_index_only(
             ):
                 direction_multiplier = 1.0 if position["action"] == "ENTER_LONG" else -1.0
                 trail_price = position["trailing_stop_price"]
+                current_close = float(current["close"])
+                close_points = direction_multiplier * (current_close - position["entry_price"])
                 trail_hit = is_new_bar and trailing_stop != "none" and (
-                    float(current["low"]) <= trail_price
+                    current_close <= trail_price
                     if direction_multiplier > 0
-                    else float(current["high"]) >= trail_price
+                    else current_close >= trail_price
                 )
-                remaining_loss_points = max_daily_loss_points + daily_realized_points
-                cap_price: float | None
-                if remaining_loss_points <= 0:
-                    cap_price = float(current["open"])
-                elif direction_multiplier > 0:
-                    cap_price = position["entry_price"] - remaining_loss_points
-                    if float(current["low"]) > cap_price:
-                        cap_price = None
-                else:
-                    cap_price = position["entry_price"] + remaining_loss_points
-                    if float(current["high"]) < cap_price:
-                        cap_price = None
-                cap_hit = cap_price is not None
-                cap_is_first = cap_hit and (
-                    not trail_hit
-                    or (
-                        cap_price is not None
-                        and (
-                            cap_price >= trail_price
-                            if direction_multiplier > 0
-                            else cap_price <= trail_price
-                        )
-                    )
-                )
-                if cap_is_first:
-                    assert cap_price is not None
-                    open_price = float(current["open"])
-                    exit_price = (
-                        min(open_price, cap_price)
-                        if direction_multiplier > 0
-                        else max(open_price, cap_price)
-                    )
-                    close_position(now, exit_price, "DAILY_MAX_LOSS")
+                cap_hit = daily_realized_points + close_points <= -max_daily_loss_points
+                if cap_hit:
+                    close_position(now, current_close, "DAILY_MAX_LOSS")
                     daily_loss_halted = True
                     counters["daily_loss_halts"] += 1
                     continue
                 if trail_hit:
-                    open_price = float(current["open"])
-                    exit_price = (
-                        min(open_price, trail_price)
-                        if direction_multiplier > 0
-                        else max(open_price, trail_price)
-                    )
-                    close_position(now, exit_price, "TRAILING_STOP")
+                    close_position(now, current_close, "TRAILING_STOP")
                     if daily_realized_points <= -max_daily_loss_points:
                         daily_loss_halted = True
                         counters["daily_loss_halts"] += 1
@@ -691,9 +657,10 @@ def _report_index(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     trailing_suffix = f"_{trailing_stop}" if trailing_stop != "none" else ""
     exit_ema_suffix = f"_exit_ema{exit_ema_period}" if exit_ema_period != 9 else ""
+    cap_suffix = f"_cap{max_daily_loss_points:g}"
     stem = (
         f"fyers_ema_{index_name.lower()}_index_replay_"
-        f"{start:%Y%m%d}_{end:%Y%m%d}{trailing_suffix}{exit_ema_suffix}"
+        f"{start:%Y%m%d}_{end:%Y%m%d}{trailing_suffix}{exit_ema_suffix}{cap_suffix}"
     )
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
@@ -709,11 +676,12 @@ def _report_index(
         f"Simulated poll interval: {poll_seconds}s.",
         "Results are directional index points, not rupee P&L; no lot multiplier, brokerage, or slippage is applied.",
         f"Daily loss cap: {max_daily_loss_points:.2f} directional index points, including realized "
-        "and open P&L; positions close at the cap level and entries stop for the day.",
-        "The cap is checked using completed five-minute index OHLC; a gap through the cap is filled "
-        "at that candle's open and can exceed the limit.",
+        "and close-based open P&L; positions exit at a completed candle close when the cap is breached, "
+        "and entries stop for the day.",
+        "Daily cap, trailing-stop, and EMA exits are evaluated on completed five-minute candle closes; "
+        "the simulated exit price is that candle's close and losses can exceed the cap.",
         f"Additional trailing stop: {trailing_stop}. Stops are checked on later completed bars and "
-        f"only tighten. The strategy exit uses EMA{exit_ema_period}.",
+        f"only tighten. The strategy exit uses a candle-close confirmation on EMA{exit_ema_period}.",
         f"Historical index cache: {'enabled' if history_cache.enabled else 'disabled'}; "
         f"cache hits={history_cache.hits}, history API fetches={history_cache.misses}.",
         f"Signals: {counters['signals']}",

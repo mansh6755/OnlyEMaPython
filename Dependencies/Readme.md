@@ -46,9 +46,10 @@ premiums. Entry and exit prices use the index close available at the simulated
 decision. Results are not rupee P&L, and no lot multiplier, fees, slippage, or
 rupee-denominated daily max-loss rule is applied. Index-only replay defaults to
 a separate 170-point daily loss cap (`--max-daily-loss-points`); it counts
-realized plus open directional points, closes at the cap level when the
-completed five-minute candle reaches it (using the candle open if it gaps past
-the cap), and blocks entries for the rest of that day. Index history is
+realized plus close-based open directional points, exits at the completed
+five-minute candle close when the cap is breached, and blocks entries for the
+rest of that day. Because exits are evaluated only at candle close, a gap or
+fast move can make the loss exceed the cap. Index history is
 requested one calendar day at a time to avoid Fyers range-request failures.
 SENSEX index testing is index-only; the options replay remains NIFTY-only.
 An index-only trailing stop can be selected with `--trailing-stop`:
@@ -62,8 +63,11 @@ in all modes. For the original/no-extra-trail variant with EMA11 exits, pass
 `--trailing-stop none --exit-ema 11`; entries are unchanged.
 The `breakeven_1r_ema11` mode uses EMA11 for both the initial 1R distance and
 the post-1R trailing level; it does not change the strategy's EMA9 exit.
-Trailing levels tighten after a completed bar and are applied to subsequent
-bars to avoid using that bar's high/low before the stop was established.
+EMA exits require a completed candle close below the selected EMA for a long
+or above it for a short; wick touches alone do not trigger an exit. Trailing
+stops and the daily loss cap are also triggered and filled at the completed
+candle close, not at an intrabar price. Trailing levels tighten after a
+completed bar and apply to subsequent bars.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
