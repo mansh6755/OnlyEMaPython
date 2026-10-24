@@ -73,7 +73,17 @@ completed bar and apply to subsequent bars.
 This separate runner reads live SENSEX index candles and option quotes from
 Fyers, but is paper-only: it does not import or call the order-execution client.
 It requires `LIVE_TRADING_ENABLED=false` explicitly and refuses startup if the
-flag is missing or true. Configure the server service's start command as
+flag is missing or true. It starts the existing Telegram Fyers OAuth service:
+if the saved token is missing or expired, it sends an authorization link to
+`FYERS_AUTH_TELEGRAM_CHAT_ID` and waits for approval; the token is then saved to
+`FYERS_TOKEN_FILE`. The same service monitors the token during runtime and
+requests new Telegram authorization when Fyers rejects it. Set
+`FYERS_APP_ID`, `FYERS_SECRET_KEY`, `FYERS_REDIRECT_URI` (the server's public
+HTTPS callback URL registered in Fyers), and `FYERS_AUTH_TELEGRAM_CHAT_ID`;
+expose the platform's `PORT` to the callback server. The notification chat is
+configured separately using `TELEGRAM_CHAT_ID`.
+
+Configure the server service's start command as
 `python Dependencies/fyers_sensex_paper_runner.py` (optionally pass `--cap 300`
 and `--poll-seconds 30`). Do not start it on a local workstation when the
 intended deployment is the production server.
@@ -95,7 +105,9 @@ can exceed it. Telegram alerts use the existing
 
 For a server deployment, set `LIVE_TRADING_ENABLED=false`,
 `TELEGRAM_ENABLED=true`, and persist the token, ledger, and state on a durable
-server volume. For example, with a volume mounted at `/data`, set
+server volume. The token file is written by Telegram authentication after you
+approve the morning Fyers login; a preloaded `FYERS_ACCESS_TOKEN` is optional.
+For example, with a volume mounted at `/data`, set
 `FYERS_TOKEN_FILE=/data/fyers_access_token`,
 `SENSEX_PAPER_TRADES_FILE=/data/fyers_sensex_paper_trades.csv`, and
 `SENSEX_PAPER_STATE_FILE=/data/fyers_sensex_paper_state.json`. The default cap

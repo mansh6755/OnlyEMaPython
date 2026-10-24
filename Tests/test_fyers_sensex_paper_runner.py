@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from Dependencies import fyers_sensex_paper_runner as paper_runner
 from Dependencies.fyers_options import FyersOptionContract
 from Dependencies.fyers_sensex_paper_runner import (
     PaperPosition,
@@ -293,6 +294,54 @@ def test_paper_runner_accepts_explicit_false_live_flag(monkeypatch):
     monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
 
     _require_paper_mode()
+
+
+def test_fyers_authentication_uses_telegram_when_no_saved_token(monkeypatch, tmp_path):
+    auth_service = type(
+        "FakeAuthService",
+        (),
+        {
+            "start": lambda self: None,
+            "authenticate_startup": lambda self, *, has_access_token: setattr(
+                self, "has_access_token", has_access_token
+            ),
+            "stop": lambda self: None,
+        },
+    )()
+    api_instances = []
+    auth_configs = []
+
+    def fake_api(app_id, token):
+        api = type("FakeAPI", (), {})()
+        api.app_id = app_id
+        api.access_token = token
+        api_instances.append(api)
+        return api
+
+    def fake_auth_service(**kwargs):
+        auth_configs.append(kwargs)
+        return auth_service
+
+    monkeypatch.setenv("FYERS_APP_ID", "paper-app")
+    monkeypatch.setenv("FYERS_TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setenv("FYERS_SECRET_KEY", "app-secret")
+    monkeypatch.setenv("FYERS_REDIRECT_URI", "https://paper.example/auth/callback")
+    monkeypatch.setenv("FYERS_AUTH_TELEGRAM_CHAT_ID", "12345")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setenv("PORT", "8080")
+    monkeypatch.setattr(paper_runner, "load_persisted_access_token", lambda *_args: "")
+    monkeypatch.setattr(paper_runner, "FyersAPI", fake_api)
+    monkeypatch.setattr(paper_runner, "FyersTelegramAuthService", fake_auth_service)
+
+    api, service = paper_runner._authenticate_fyers_through_telegram()
+
+    assert api is api_instances[0]
+    assert api.access_token == "telegram-auth-pending"
+    assert service is auth_service
+    assert service.has_access_token is False
+    assert auth_configs[0]["port"] == 8080
+    assert auth_configs[0]["authorized_chat_id"] == "12345"
+    assert auth_configs[0]["redirect_uri"] == "https://paper.example/auth/callback"
 
 
 def test_exit_message_includes_contract_option_pnl_and_index_points():

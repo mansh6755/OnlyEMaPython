@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import logging
@@ -27,7 +28,10 @@ from Dependencies.fyers_api import FyersAPI, FyersAPIError  # noqa: E402
 from Dependencies.fyers_ema_replay import ENV_FILE, IST, _load_signal_logic  # noqa: E402
 from Dependencies.fyers_market_data import completed_five_minute_bars  # noqa: E402
 from Dependencies.fyers_options import FyersOptionContract  # noqa: E402
-from Dependencies.fyers_telegram_auth import load_persisted_access_token  # noqa: E402
+from Dependencies.fyers_telegram_auth import (  # noqa: E402
+    FyersTelegramAuthService,
+    load_persisted_access_token,
+)
 from Dependencies.telegram_notifier import TelegramNotifier  # noqa: E402
 
 INDEX_SYMBOL = "BSE:SENSEX-INDEX"
@@ -532,6 +536,39 @@ def _require_paper_mode() -> None:
         )
 
 
+def _authenticate_fyers_through_telegram() -> tuple[FyersAPI, FyersTelegramAuthService]:
+    app_id = os.getenv("FYERS_APP_ID", "").strip()
+    if not app_id:
+        raise RuntimeError("Set FYERS_APP_ID for Fyers authentication.")
+    token_file_value = os.getenv("FYERS_TOKEN_FILE", "").strip()
+    token_file = (
+        Path(token_file_value).expanduser()
+        if token_file_value
+        else ROOT_DIR / "Dependencies" / ".fyers_access_token"
+    )
+    if not token_file.is_absolute():
+        token_file = ROOT_DIR / token_file
+    access_token = load_persisted_access_token(token_file, os.getenv("FYERS_ACCESS_TOKEN", ""))
+    api = FyersAPI(app_id, access_token or "telegram-auth-pending")
+    auth_service = FyersTelegramAuthService(
+        bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        authorized_chat_id=os.getenv("FYERS_AUTH_TELEGRAM_CHAT_ID", ""),
+        client_id=app_id,
+        secret_key=os.getenv("FYERS_SECRET_KEY", ""),
+        redirect_uri=os.getenv("FYERS_REDIRECT_URI", ""),
+        token_file=token_file,
+        market_data_client=api,
+        port=int(os.getenv("PORT", "8787")),
+    )
+    try:
+        auth_service.start()
+        auth_service.authenticate_startup(has_access_token=bool(access_token))
+    except BaseException:
+        auth_service.stop()
+        raise
+    return api, auth_service
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     load_dotenv(ENV_FILE, override=False)
@@ -563,21 +600,9 @@ def main(argv: list[str] | None = None) -> int:
     if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or not os.getenv("TELEGRAM_CHAT_ID", "").strip():
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for SENSEX paper alerts.")
     notifier = TelegramNotifier.from_environment()
-    app_id = os.getenv("FYERS_APP_ID", "").strip()
-    token_file_value = os.getenv("FYERS_TOKEN_FILE", "").strip()
-    token_file = (
-        Path(token_file_value).expanduser()
-        if token_file_value
-        else ROOT_DIR / "Dependencies" / ".fyers_access_token"
-    )
-    if not token_file.is_absolute():
-        token_file = ROOT_DIR / token_file
-    access_token = load_persisted_access_token(token_file, os.getenv("FYERS_ACCESS_TOKEN", ""))
-    if not app_id or not access_token:
-        raise RuntimeError("Set FYERS_APP_ID and a valid FYERS_ACCESS_TOKEN/token file.")
-
-    api = FyersAPI(app_id, access_token)
-    api.validate_session()
+    atexit.register(notifier.close, timeout=10.0)
+    api, auth_service = _authenticate_fyers_through_telegram()
+    atexit.register(auth_service.stop)
     logic = _load_signal_logic()
     strategy_config = logic.EMATrendConfig(exit_ema_period=9)
     engine = SensexPaperEngine(
@@ -614,7 +639,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             notifier.notify(_format_exit_message(closing_position, trade))
         LOGGER.info("SENSEX paper session ended at square-off.")
+        auth_service.stop()
+        atexit.unregister(auth_service.stop)
         notifier.close()
+        atexit.unregister(notifier.close)
         return 0
 
     while True:
