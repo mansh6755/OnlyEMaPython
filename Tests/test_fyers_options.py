@@ -4,6 +4,8 @@ import pytest
 
 from Dependencies.fyers_options import (
     select_atm_option,
+    select_nearest_atm_option,
+    select_nearest_expiry,
     select_next_week_atm_option,
     select_next_week_expiry,
 )
@@ -26,6 +28,16 @@ def test_select_next_week_expiry_skips_current_week_and_sorts_candidates():
 def test_select_next_week_expiry_fails_when_fyers_has_none():
     with pytest.raises(ValueError, match="no listed expiry"):
         select_next_week_expiry(["2026-10-08", "2026-10-20"], today=date(2026, 10, 9))
+
+
+def test_select_nearest_expiry_includes_today_and_skips_expired_dates():
+    selected = select_nearest_expiry(
+        ["2026-10-22", "2026-10-24", "2026-10-29", "2026-11-05"],
+        today=date(2026, 10, 24),
+    )
+
+    assert selected == date(2026, 10, 24)
+
 
 
 @pytest.mark.parametrize(
@@ -93,3 +105,38 @@ def test_select_next_week_atm_option_ignores_other_expiries():
 
     assert selected.symbol == "NSE:NIFTY26O1324100CE"
     assert selected.expiry == date(2026, 10, 13)
+
+
+def test_select_nearest_atm_option_uses_nearest_expiry_and_signal_side():
+    selected = select_nearest_atm_option(
+        [
+            {
+                "symbol": "BSE:SENSEX26OCT80000PE",
+                "expiry": "2026-10-29",
+                "option_type": "PE",
+                "strike_price": 80000,
+                "lot_size": 20,
+            },
+            {
+                "symbol": "BSE:SENSEX26OCT80000CE",
+                "expiry": "2026-10-29",
+                "option_type": "CE",
+                "strike_price": 80000,
+                "lot_size": 20,
+            },
+            {
+                "symbol": "BSE:SENSEX26NOV80000CE",
+                "expiry": "2026-11-26",
+                "option_type": "CE",
+                "strike_price": 80000,
+                "lot_size": 20,
+            },
+        ],
+        action="ENTER_LONG",
+        spot=80012,
+        today=date(2026, 10, 24),
+    )
+
+    assert selected.symbol == "BSE:SENSEX26OCT80000CE"
+    assert selected.expiry == date(2026, 10, 29)
+    assert selected.lot_size == 20

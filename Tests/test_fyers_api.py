@@ -3,7 +3,14 @@ from datetime import UTC, datetime
 
 import pytest
 
-from Dependencies.fyers_api import FyersAPI, FyersAPIError, build_auth_url, parse_nse_fo_master, quote_ltp
+from Dependencies.fyers_api import (
+    FyersAPI,
+    FyersAPIError,
+    build_auth_url,
+    parse_fyers_fo_master,
+    parse_nse_fo_master,
+    quote_ltp,
+)
 
 
 class _Response:
@@ -24,6 +31,24 @@ class _Session:
     def request(self, *args, **kwargs):
         self.last_request = (args, kwargs)
         return self.response
+
+
+class _MasterResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        return None
+
+
+class _MasterSession:
+    def __init__(self, text):
+        self.text = text
+        self.url = None
+
+    def get(self, url, timeout):
+        self.url = url
+        return _MasterResponse(self.text)
 
 
 def test_quote_ltp_reads_the_requested_fyers_symbol():
@@ -74,6 +99,35 @@ def test_parse_nse_fo_master_reads_exact_symbol_and_lot_size_columns():
             "lot_size": 65,
         }
     ]
+
+
+def test_parse_bse_fo_master_reads_sensex_contract_and_resolves_nearest_atm():
+    rows = "\n".join(
+        [
+            "12112610291122489,SENSEX 29 Oct 26 69600 PE,14,20,0.05,,0915-1540:,"
+            "2026-10-23,1793268600,BSE:SENSEX26OCT69600PE,12,11,1122489,SENSEX,1,69600.0,PE",
+            "12112610291122490,SENSEX 29 Oct 26 69600 CE,14,20,0.05,,0915-1540:,"
+            "2026-10-23,1793268600,BSE:SENSEX26OCT69600CE,12,11,1122490,SENSEX,1,69600.0,CE",
+            "12112611291122491,SENSEX 26 Nov 26 69600 CE,14,20,0.05,,0915-1540:,"
+            "2026-10-23,1795687800,BSE:SENSEX26NOV69600CE,12,11,1122491,SENSEX,1,69600.0,CE",
+        ]
+    )
+    parsed = parse_fyers_fo_master(rows)
+    session = _MasterSession(rows)
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    contract = api.resolve_nearest_option(
+        "ENTER_LONG",
+        spot=69610.0,
+        today=datetime(2026, 10, 24).date(),
+    )
+
+    assert parsed[0]["underlying"] == "SENSEX"
+    assert contract.symbol == "BSE:SENSEX26OCT69600CE"
+    assert contract.option_type == "CE"
+    assert contract.lot_size == 20
+    assert contract.expiry.isoformat() == "2026-10-29"
+    assert session.url == "https://public.fyers.in/sym_details/BSE_FO.csv"
 
 
 def test_fyers_history_converts_epoch_candles_to_ist_ohlcv():

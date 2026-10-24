@@ -69,6 +69,41 @@ stops and the daily loss cap are also triggered and filled at the completed
 candle close, not at an intrabar price. Trailing levels tighten after a
 completed bar and apply to subsequent bars.
 
+## SENSEX EMA9-touch paper runner
+This separate runner reads live SENSEX index candles and option quotes from
+Fyers, but is paper-only: it does not import or call the order-execution client.
+It requires `LIVE_TRADING_ENABLED=false` explicitly and refuses startup if the
+flag is missing or true. Configure the server service's start command as
+`python Dependencies/fyers_sensex_paper_runner.py` (optionally pass `--cap 300`
+and `--poll-seconds 30`). Do not start it on a local workstation when the
+intended deployment is the production server.
+
+Signals use completed five-minute candles. LONG buys the nearest-expiry ATM CE;
+SHORT buys the nearest-expiry ATM PE. The selected contract's official lot size
+is used for one lot, and option entries/exits are paper-marked at live LTP.
+EMA9-touch exits follow the historical replay rule: check each completed
+one-minute SENSEX candle against the prior completed five-minute EMA9; if a
+candle gaps through that level, use its open, otherwise use the EMA9 threshold.
+Trailing stop and the 300-point daily loss cap are checked at completed
+five-minute closes, in the same order as the replay. These triggers use the
+SENSEX index, not option premium. Option rupee P&L uses option LTP snapshots, so
+option fills remain estimates and the historical index-only replay does not
+verify them. The index-point cap counts realized plus open directional index
+points at completed five-minute closes; it is not a rupee loss limit, and gaps
+can exceed it. Telegram alerts use the existing
+`TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` configuration.
+
+For a server deployment, set `LIVE_TRADING_ENABLED=false`,
+`TELEGRAM_ENABLED=true`, and persist the token, ledger, and state on a durable
+server volume. For example, with a volume mounted at `/data`, set
+`FYERS_TOKEN_FILE=/data/fyers_access_token`,
+`SENSEX_PAPER_TRADES_FILE=/data/fyers_sensex_paper_trades.csv`, and
+`SENSEX_PAPER_STATE_FILE=/data/fyers_sensex_paper_state.json`. The default cap
+and polling interval are configurable through `SENSEX_PAPER_DAILY_LOSS_CAP`
+(300) and `SENSEX_PAPER_POLL_SECONDS` (30), or CLI flags. Keep the same cap
+when resuming a saved state. The runner rejects incompatible state versions and
+ledger schemas rather than silently resetting them. Use `--help` to see options.
+
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
 

@@ -68,6 +68,26 @@ def select_next_week_expiry(expiries: Iterable[Any], *, today: date) -> date:
     return min(candidates)
 
 
+def select_nearest_expiry(expiries: Iterable[Any], *, today: date) -> date:
+    """Select the earliest listed expiry that has not passed."""
+    candidates: set[date] = set()
+    for item in expiries:
+        value = item
+        if isinstance(item, dict):
+            value = item.get("date") or item.get("expiry")
+        if value is None:
+            continue
+        try:
+            expiry = _parse_expiry(value)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if expiry >= today:
+            candidates.add(expiry)
+    if not candidates:
+        raise ValueError(f"Fyers returned no unexpired listed option expiry on or after {today}.")
+    return min(candidates)
+
+
 def select_atm_option(
     options: Iterable[dict[str, Any]],
     *,
@@ -125,6 +145,26 @@ def select_next_week_atm_option(
 ) -> FyersOptionContract:
     rows = [row for row in options if isinstance(row, dict)]
     expiry = select_next_week_expiry((row.get("expiry") for row in rows), today=today)
+    expiry_options = []
+    for row in rows:
+        try:
+            row_expiry = _parse_expiry(row.get("expiry"))
+        except (OverflowError, OSError, ValueError):
+            continue
+        if row_expiry == expiry:
+            expiry_options.append(row)
+    return select_atm_option(expiry_options, action=action, spot=spot, expiry=expiry)
+
+
+def select_nearest_atm_option(
+    options: Iterable[dict[str, Any]],
+    *,
+    action: str,
+    spot: float,
+    today: date,
+) -> FyersOptionContract:
+    rows = [row for row in options if isinstance(row, dict)]
+    expiry = select_nearest_expiry((row.get("expiry") for row in rows), today=today)
     expiry_options = []
     for row in rows:
         try:
