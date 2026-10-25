@@ -31,8 +31,8 @@ from Dependencies.fyers_market_data import completed_five_minute_bars  # noqa: E
 from Dependencies.fyers_telegram_auth import load_persisted_access_token  # noqa: E402
 
 INDEX_SYMBOL = "BSE:SENSEX-INDEX"
-DEFAULT_START = date(2026, 1, 1)
-DEFAULT_END = date(2026, 10, 22)
+DEFAULT_START = date(2022, 1, 1)
+DEFAULT_END = date(2026, 10, 23)
 DEFAULT_CAPS = (250.0, 300.0)
 ENTRY_START = time(9, 25)
 SQUARE_OFF = time(15, 15)
@@ -136,7 +136,7 @@ def replay_sensex_touch_cap(
     engine = signal_logic.EMATrendSignalEngine(strategy_config)
 
     def close_position(at: pd.Timestamp, price: float, reason: str) -> None:
-        nonlocal position, daily_realized_points
+        nonlocal position, daily_realized_points, daily_loss_halted
         assert position is not None
         direction = 1.0 if position["signal"] == "ENTER_LONG" else -1.0
         points = direction * (price - position["entry_price"])
@@ -153,6 +153,11 @@ def replay_sensex_touch_cap(
             }
         )
         daily_realized_points += points
+
+        # Centralize cap check so all exits correctly trigger the daily halt
+        if daily_realized_points <= -daily_loss_cap:
+            daily_loss_halted = True
+
         position = None
 
     for bar_index, bar in enriched_bars.iterrows():
@@ -169,50 +174,48 @@ def replay_sensex_touch_cap(
         position_open_at_bar_start = position is not None
         minute_group = minutes_by_bar.get(bar_start)
 
-        if position is not None and bar_index > position["entry_bar_index"] and minute_group is not None:
+        if position is not None and bar_index > position["entry_bar_index"]:
             prior_ema9 = float(enriched_bars.iloc[bar_index - 1]["ema9"]) if bar_index > 0 else np.nan
-            for minute in minute_group.itertuples(index=False):
-                minute_close_time = minute.timestamp + pd.Timedelta(minutes=1)
-                if position is None:
-                    break
-                if minute.timestamp < position["entry_time"]:
-                    continue
 
-                if minute_close_time == bar_close_time:
-                    direction = 1.0 if position["signal"] == "ENTER_LONG" else -1.0
-                    close_points = direction * (float(bar["close"]) - position["entry_price"])
-                    if daily_realized_points + close_points <= -daily_loss_cap:
-                        close_position(bar_close_time, float(bar["close"]), "DAILY_MAX_LOSS")
-                        daily_loss_halted = True
+            # 1. Intra-bar checks (EMA9 Touch via minute data)
+            if minute_group is not None and math.isfinite(prior_ema9):
+                for minute in minute_group.itertuples(index=False):
+                    if position is None:
                         break
+                    if minute.timestamp < position["entry_time"]:
+                        continue
 
+                    minute_close_time = minute.timestamp + pd.Timedelta(minutes=1)
+                    if position["signal"] == "ENTER_LONG" and float(minute.low) <= prior_ema9:
+                        fill = float(minute.open) if float(minute.open) <= prior_ema9 else prior_ema9
+                        close_position(minute_close_time, fill, "EMA9_TOUCH")
+                    elif position["signal"] == "ENTER_SHORT" and float(minute.high) >= prior_ema9:
+                        fill = float(minute.open) if float(minute.open) >= prior_ema9 else prior_ema9
+                        close_position(minute_close_time, fill, "EMA9_TOUCH")
+
+            # 2. End-of-bar checks (Trail, Cap, Square-off) evaluated sequentially at the 5-min close
+            if position is not None:
+                direction = 1.0 if position["signal"] == "ENTER_LONG" else -1.0
+                close_points = direction * (float(bar["close"]) - position["entry_price"])
+
+                if daily_realized_points + close_points <= -daily_loss_cap:
+                    close_position(bar_close_time, float(bar["close"]), "DAILY_MAX_LOSS")
+                else:
                     trailing_stop = position["trailing_stop"]
                     trail_hit = (
                         float(bar["close"]) <= trailing_stop if direction > 0 else float(bar["close"]) >= trailing_stop
                     )
                     if trail_hit:
                         close_position(bar_close_time, float(bar["close"]), "TRAILING_STOP")
-                        if daily_realized_points <= -daily_loss_cap:
-                            daily_loss_halted = True
-                        break
-                    if bar_close_time.time() >= SQUARE_OFF:
+                    elif bar_close_time.time() >= SQUARE_OFF:
                         close_position(bar_close_time, float(bar["close"]), "SQUARE_OFF")
-                        break
-
-                    current_ema9 = float(bar["ema9"])
-                    if math.isfinite(current_ema9):
-                        position["trailing_stop"] = (
-                            max(trailing_stop, current_ema9) if direction > 0 else min(trailing_stop, current_ema9)
-                        )
-
-                if position is None or not math.isfinite(prior_ema9):
-                    continue
-                if position["signal"] == "ENTER_LONG" and float(minute.low) <= prior_ema9:
-                    fill = float(minute.open) if float(minute.open) <= prior_ema9 else prior_ema9
-                    close_position(minute_close_time, fill, "EMA9_TOUCH")
-                elif position is not None and position["signal"] == "ENTER_SHORT" and float(minute.high) >= prior_ema9:
-                    fill = float(minute.open) if float(minute.open) >= prior_ema9 else prior_ema9
-                    close_position(minute_close_time, fill, "EMA9_TOUCH")
+                    else:
+                        # Ratchet trailing stop for the next candle if position survives
+                        current_ema9 = float(bar["ema9"])
+                        if math.isfinite(current_ema9):
+                            position["trailing_stop"] = (
+                                max(trailing_stop, current_ema9) if direction > 0 else min(trailing_stop, current_ema9)
+                            )
 
         if position is not None or position_open_at_bar_start:
             continue
@@ -247,7 +250,8 @@ def replay_sensex_touch_cap(
 def _trade_metrics(trades: pd.DataFrame, cap: float) -> dict[str, Any]:
     points = pd.to_numeric(trades["index_points"], errors="raise")
     equity = points.cumsum()
-    drawdown = equity - equity.cummax()
+    # Fixed drawdown calculation to yield a positive magnitude
+    drawdown = equity.cummax() - equity
     cap_exit_days = trades.loc[trades["exit_reason"] == "DAILY_MAX_LOSS", "exit_time"].str[:10].nunique()
     return {
         "trades": len(trades),
@@ -255,7 +259,7 @@ def _trade_metrics(trades: pd.DataFrame, cap: float) -> dict[str, Any]:
         "losses": int((points < 0).sum()),
         "win_rate": float((points > 0).mean() * 100.0) if len(points) else 0.0,
         "net_points": float(points.sum()),
-        "max_drawdown": float(drawdown.min()) if len(drawdown) else 0.0,
+        "max_drawdown": float(drawdown.max()) if len(drawdown) else 0.0,
         "cap_hit_days": int(cap_exit_days),
         "exit_counts": trades["exit_reason"].value_counts().to_dict(),
         "cap": cap,
@@ -401,15 +405,25 @@ def main(argv: list[str] | None = None) -> int:
         cache_enabled=not args.no_cache,
         refresh_cache=args.refresh_cache,
     )
+
+    # Ensure minute timestamps are localized to IST before filtering via dt.date
+    if "timestamp" in minute_history:
+        if minute_history["timestamp"].dt.tz is None:
+            minute_history["timestamp"] = minute_history["timestamp"].dt.tz_localize(IST)
+        else:
+            minute_history["timestamp"] = minute_history["timestamp"].dt.tz_convert(IST)
+
     five_minute = completed_five_minute_bars(
         minute_history,
         datetime.combine(args.end_date + timedelta(days=1), time.min, tzinfo=IST),
     )
     if five_minute.empty:
         raise RuntimeError("No complete SENSEX five-minute bars were built from Fyers minute history.")
+
     logic = _load_signal_logic()
     config = logic.EMATrendConfig(exit_ema_period=9)
     enriched = logic.build_ema_trend_with_indicators(five_minute, config)
+
     test_minute = minute_history[minute_history["timestamp"].dt.date.between(args.start_date, args.end_date)].copy()
     if test_minute.empty:
         raise RuntimeError("Fetched SENSEX history contains no minute candles in the test date range.")
