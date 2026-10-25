@@ -47,7 +47,9 @@ weekday 9:15 AM–3:20 PM IST market session so historical requests do not
 compete with live market polling. Backtests use one lot, two strikes ITM, the ₹3,500
 daily option loss cap, and historical Fyers index/option candles. Results show
 the trade list and summary; P&L excludes brokerage, taxes, bid-ask spread, and
-slippage. Only one dashboard backtest runs at a time.
+slippage. Both date fields default to the latest date for which Fyers has index
+candles, so weekends and exchange holidays resolve to the preceding trading
+session. Only one dashboard backtest runs at a time.
 
 To enable live orders, set `EMA9_EXECUTION_MODE=LIVE`; leaving it unset or set to
 `PAPER` keeps this runner paper-only. This is the sole execution-mode switch for

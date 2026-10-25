@@ -15,6 +15,7 @@ from Dependencies.fyers_ema9_forward_runner import (
     _create_telegram_notifier,
     _format_health_alert,
     _is_market_data_session,
+    _latest_trading_day,
     _quote_ltp,
     _validate_live_resume,
     execution_mode_from_environment,
@@ -109,6 +110,39 @@ def test_hourly_health_alert_reports_runner_and_market_status(tmp_path):
 )
 def test_market_data_session_bounds(at, expected):
     assert _is_market_data_session(at) is expected
+
+
+@pytest.mark.parametrize(
+    ("today", "last_bar_time"),
+    [
+        (date(2026, 10, 26), "2026-10-26 15:14:00"),
+        (date(2026, 10, 25), "2026-10-23 15:14:00"),
+        (date(2026, 10, 26), "2026-10-22 15:14:00"),
+    ],
+)
+def test_latest_trading_day_uses_latest_fyers_candle(today, last_bar_time):
+    class HistoryApi:
+        def history(self, symbol, *, resolution, start, end):
+            assert symbol == "BSE:SENSEX-INDEX"
+            assert resolution == "1"
+            assert end == today
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(
+                        ["2026-10-22 15:14:00", last_bar_time],
+                        errors="coerce",
+                    ).tz_localize(IST)
+                }
+            )
+
+    assert (
+        _latest_trading_day(
+            HistoryApi(),
+            "BSE:SENSEX-INDEX",
+            today=today,
+        )
+        == date.fromisoformat(last_bar_time[:10])
+    )
 
 
 @pytest.mark.parametrize(

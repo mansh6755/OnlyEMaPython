@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse, urlsplit
 from zoneinfo import ZoneInfo
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -162,6 +161,7 @@ class FyersTelegramAuthService:
         dashboard_state: Any | None = None,
         dashboard_enabled: bool = False,
         dashboard_backtest_runner: Callable[[date, date], dict[str, Any]] | None = None,
+        dashboard_last_trading_day: Callable[[], date] | None = None,
     ) -> None:
         parsed_redirect = urlparse(redirect_uri)
         callback_path = parsed_redirect.path.rstrip("/") or "/"
@@ -200,6 +200,7 @@ class FyersTelegramAuthService:
             if dashboard_enabled and dashboard_backtest_runner
             else None
         )
+        self.dashboard_last_trading_day = dashboard_last_trading_day
         self._dashboard_assets = (
             {
                 route: (path.read_bytes(), content_type)
@@ -269,6 +270,25 @@ class FyersTelegramAuthService:
 
             def _dashboard(self, request_path: str) -> bool:
                 is_job_status = request_path.startswith("/api/backtest/")
+                if request_path == "/api/backtest/default-date":
+                    if not service.dashboard_enabled or service.dashboard_last_trading_day is None:
+                        self._respond(404, "Backtest date lookup is disabled.")
+                        return True
+                    try:
+                        trading_day = service.dashboard_last_trading_day()
+                    except Exception as exc:
+                        LOGGER.exception("Could not identify the latest Fyers trading day.")
+                        self._respond(503, f"Unable to find the latest trading day ({type(exc).__name__}).")
+                        return True
+                    if not isinstance(trading_day, date):
+                        self._respond(503, "Trading-day lookup returned an invalid date.")
+                        return True
+                    body = json.dumps(
+                        {"last_trading_day": trading_day.isoformat()},
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    self._respond_bytes(200, body, "application/json; charset=utf-8")
+                    return True
                 if (
                     request_path not in DASHBOARD_ASSET_ROUTES
                     and request_path != "/api/dashboard"

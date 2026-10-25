@@ -127,6 +127,27 @@ def _is_market_data_session(at: datetime) -> bool:
     )
 
 
+def _latest_trading_day(api: FyersAPI, index_symbol: str, *, today: date) -> date:
+    recent_bars = api.history(
+        index_symbol,
+        resolution="1",
+        start=today - timedelta(days=30),
+        end=today,
+    )
+    if recent_bars.empty or "timestamp" not in recent_bars:
+        raise RuntimeError("Fyers returned no recent index candles.")
+    timestamps = pd.to_datetime(recent_bars["timestamp"], errors="coerce")
+    if timestamps.dt.tz is None:
+        timestamps = timestamps.dt.tz_localize(IST)
+    else:
+        timestamps = timestamps.dt.tz_convert(IST)
+    available_days = timestamps.dropna().dt.date
+    available_days = available_days[available_days <= today]
+    if available_days.empty:
+        raise RuntimeError("Fyers returned no valid recent trading-day candles.")
+    return max(available_days)
+
+
 def select_itm_contract(
     rows: list[dict[str, Any]],
     *,
@@ -1207,6 +1228,11 @@ def _run_forward_runner(
             end=end,
         )
 
+    def get_latest_trading_day() -> date:
+        return _latest_trading_day(
+            api, config.index_symbol, today=datetime.now(IST).date()
+        )
+
     auth_service = FyersTelegramAuthService(
         bot_token=environment.get("TELEGRAM_BOT_TOKEN", ""),
         authorized_chat_id=environment.get("FYERS_AUTH_TELEGRAM_CHAT_ID", ""),
@@ -1219,6 +1245,7 @@ def _run_forward_runner(
         dashboard_state=dashboard_state,
         dashboard_enabled=dashboard_enabled,
         dashboard_backtest_runner=run_dashboard_backtest_for_range,
+        dashboard_last_trading_day=get_latest_trading_day,
     )
     execution = FyersExecutionClient(api)
     runner = EMA9ForwardRunner(

@@ -40,6 +40,20 @@
       activeInstrument = snapshot.service?.instrument || "EMA9";
       instrument.textContent = `${activeInstrument} · EMA9 FORWARD TEST`;
       byId("instrument-heading").textContent = activeInstrument;
+      const dateResponse = await fetch("/api/backtest/default-date", { cache: "no-store" });
+      if (!dateResponse.ok) {
+        const detail = await dateResponse.text();
+        throw new Error(detail || `Trading-day lookup returned ${dateResponse.status}`);
+      }
+      const dateData = await dateResponse.json();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateData.last_trading_day || "")) {
+        throw new Error("The server returned an invalid last trading date.");
+      }
+      byId("start-date").value = dateData.last_trading_day;
+      byId("end-date").value = dateData.last_trading_day;
+      byId("start-date").max = dateData.last_trading_day;
+      byId("end-date").max = dateData.last_trading_day;
+      setStatus(`Date range defaults to the latest available trading day: ${dateData.last_trading_day}.`);
       runButton.disabled = false;
     } catch (error) {
       runButton.disabled = true;

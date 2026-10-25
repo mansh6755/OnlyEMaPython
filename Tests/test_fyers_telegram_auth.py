@@ -3,7 +3,7 @@ import json
 import os
 import socket
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
@@ -379,6 +379,7 @@ def test_dashboard_backtest_runs_without_token_in_background(tmp_path, monkeypat
         port=_unused_port(),
         dashboard_state=Mock(snapshot=lambda: {"service": {"instrument": "SENSEX"}}),
         dashboard_enabled=True,
+        dashboard_last_trading_day=lambda: date(2026, 10, 23),
         dashboard_backtest_runner=lambda start, end: {
             "instrument": "SENSEX",
             "start_date": start.isoformat(),
@@ -403,6 +404,9 @@ def test_dashboard_backtest_runs_without_token_in_background(tmp_path, monkeypat
     )
     try:
         page_status, page = request("/backtest")
+        default_date_status, default_date_body = request(
+            "/api/backtest/default-date"
+        )
         accepted_status, accepted_body = request(
             "/api/backtest",
             method="POST",
@@ -412,6 +416,8 @@ def test_dashboard_backtest_runs_without_token_in_background(tmp_path, monkeypat
 
         assert page_status == 200
         assert b'type="date"' in page
+        assert default_date_status == 200
+        assert json.loads(default_date_body) == {"last_trading_day": "2026-10-23"}
         assert accepted_status == 202
         job = json.loads(accepted_body)
         assert job["status"] in {"RUNNING", "COMPLETED"}
