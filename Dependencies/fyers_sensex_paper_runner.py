@@ -59,7 +59,7 @@ TRADE_COLUMNS = [
     "exit_option_price",
     "option_pnl",
 ]
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -96,10 +96,14 @@ class SensexPaperEngine:
         daily_loss_cap: float,
         trades_path: Path,
         state_path: Path,
+        ema9_buffer_points: float = 0.0,
     ) -> None:
         if not math.isfinite(daily_loss_cap) or daily_loss_cap <= 0:
             raise ValueError("daily_loss_cap must be positive and finite.")
+        if not math.isfinite(ema9_buffer_points) or ema9_buffer_points < 0:
+            raise ValueError("ema9_buffer_points must be finite and non-negative.")
         self.daily_loss_cap = daily_loss_cap
+        self.ema9_buffer_points = ema9_buffer_points
         self.trades_path = trades_path
         self.state_path = state_path
         self.position: PaperPosition | None = None
@@ -123,6 +127,12 @@ class SensexPaperEngine:
             if saved_cap != self.daily_loss_cap:
                 raise RuntimeError(
                     "The SENSEX paper cap differs from the saved state. Resume with the original cap "
+                    "or archive the state and trade ledger before starting a new paper run."
+                )
+            saved_buffer = float(state["ema9_buffer_points"])
+            if saved_buffer != self.ema9_buffer_points:
+                raise RuntimeError(
+                    "The SENSEX EMA9 buffer differs from the saved state. Resume with the original buffer "
                     "or archive the state and trade ledger before starting a new paper run."
                 )
             self.daily_realized_points = float(state["daily_realized_points"])
@@ -155,6 +165,7 @@ class SensexPaperEngine:
         state = {
             "version": STATE_VERSION,
             "daily_loss_cap": self.daily_loss_cap,
+            "ema9_buffer_points": self.ema9_buffer_points,
             "daily_realized_points": self.daily_realized_points,
             "daily_loss_halted": self.daily_loss_halted,
             "trading_day": self.trading_day.isoformat() if self.trading_day else None,
@@ -350,6 +361,8 @@ class SensexPaperEngine:
                     prior_ema9 = float(
                         enriched_bars.iloc[bar_index - 1]["ema9"]
                     ) if bar_index > 0 else math.nan
+                    direction = 1.0 if self.position.signal == "ENTER_LONG" else -1.0
+                    prior_stop = prior_ema9 - direction * self.ema9_buffer_points
                     for minute in minute_group.itertuples(index=False):
                         if self.position is None:
                             break
@@ -396,28 +409,29 @@ class SensexPaperEngine:
                             else:
                                 current_ema9 = float(bar["ema9"])
                                 if math.isfinite(current_ema9):
+                                    buffered_ema9 = current_ema9 - direction * self.ema9_buffer_points
                                     self.position.trailing_stop = (
-                                        max(self.position.trailing_stop, current_ema9)
+                                        max(self.position.trailing_stop, buffered_ema9)
                                         if direction > 0
-                                        else min(self.position.trailing_stop, current_ema9)
+                                        else min(self.position.trailing_stop, buffered_ema9)
                                     )
 
-                        if self.position is None or not math.isfinite(prior_ema9):
+                        if self.position is None or not math.isfinite(prior_stop):
                             continue
-                        if self.position.signal == "ENTER_LONG" and float(minute.low) <= prior_ema9:
+                        if self.position.signal == "ENTER_LONG" and float(minute.low) <= prior_stop:
                             exit_index = (
                                 float(minute.open)
-                                if float(minute.open) <= prior_ema9
-                                else prior_ema9
+                                if float(minute.open) <= prior_stop
+                                else prior_stop
                             )
                         elif (
                             self.position.signal == "ENTER_SHORT"
-                            and float(minute.high) >= prior_ema9
+                            and float(minute.high) >= prior_stop
                         ):
                             exit_index = (
                                 float(minute.open)
-                                if float(minute.open) >= prior_ema9
-                                else prior_ema9
+                                if float(minute.open) >= prior_stop
+                                else prior_stop
                             )
                         else:
                             continue
@@ -442,6 +456,7 @@ class SensexPaperEngine:
                 if decision.action in {"ENTER_LONG", "ENTER_SHORT"}:
                     entry_ema9 = float(bar["ema9"])
                     if math.isfinite(entry_ema9):
+                        direction_sign = 1.0 if decision.action == "ENTER_LONG" else -1.0
                         contract = api.resolve_nearest_option(
                             decision.action,
                             spot=float(bar["close"]),
@@ -454,7 +469,7 @@ class SensexPaperEngine:
                             signal_bar_start=bar_start.isoformat(),
                             entry_time=bar_close_time.isoformat(),
                             entry_index=float(bar["close"]),
-                            trailing_stop=entry_ema9,
+                            trailing_stop=entry_ema9 - direction_sign * self.ema9_buffer_points,
                             contract=contract,
                             quantity=contract.lot_size,
                             entry_option_price=option_price,
@@ -476,6 +491,11 @@ class SensexPaperEngine:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cap", type=float, help="Daily loss cap in SENSEX points.")
+    parser.add_argument(
+        "--ema9-buffer-points",
+        type=float,
+        help="EMA9 stop cushion in SENSEX points (default: 3).",
+    )
     parser.add_argument(
         "--poll-seconds",
         type=int,
@@ -578,6 +598,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.cap is not None
         else float(os.getenv("SENSEX_PAPER_DAILY_LOSS_CAP", "300"))
     )
+    args.ema9_buffer_points = (
+        args.ema9_buffer_points
+        if args.ema9_buffer_points is not None
+        else float(os.getenv("SENSEX_PAPER_EMA9_BUFFER_POINTS", "3"))
+    )
     args.poll_seconds = (
         args.poll_seconds
         if args.poll_seconds is not None
@@ -585,6 +610,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not math.isfinite(args.cap) or args.cap <= 0:
         raise SystemExit("--cap must be positive and finite.")
+    if not math.isfinite(args.ema9_buffer_points) or args.ema9_buffer_points < 0:
+        raise SystemExit("--ema9-buffer-points must be finite and non-negative.")
     if args.poll_seconds <= 0 or args.poll_seconds > 120:
         raise SystemExit("--poll-seconds must be between 1 and 120.")
     args.trades_file = args.trades_file or Path(
@@ -607,12 +634,15 @@ def main(argv: list[str] | None = None) -> int:
     strategy_config = logic.EMATrendConfig(exit_ema_period=9)
     engine = SensexPaperEngine(
         daily_loss_cap=args.cap,
+        ema9_buffer_points=args.ema9_buffer_points,
         trades_path=args.trades_file,
         state_path=args.state_file,
     )
     LOGGER.info(
-        "SENSEX EMA9-touch PAPER options runner started; cap=%s index points; poll=%ss; no orders will be submitted.",
+        "SENSEX EMA9-touch PAPER options runner started; cap=%s index points; EMA9 buffer=%s points; "
+        "poll=%ss; no orders will be submitted.",
         args.cap,
+        args.ema9_buffer_points,
         args.poll_seconds,
     )
     notifier.notify(
@@ -620,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
         "Mode: PAPER\n"
         f"Underlying: {INDEX_SYMBOL}\n"
         f"Daily loss cap: {args.cap:g} SENSEX index points\n"
+        f"EMA9 stop buffer: {args.ema9_buffer_points:g} SENSEX points\n"
         "Contracts: nearest-expiry ATM; BUY CE for LONG / BUY PE for SHORT\n"
         "Timeframe: completed five-minute candles"
     )

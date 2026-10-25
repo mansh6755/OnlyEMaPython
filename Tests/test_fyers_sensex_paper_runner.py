@@ -98,9 +98,10 @@ def _minutes(*, first_low=999.0, first_open=1000.0):
     )
 
 
-def _engine(tmp_path, cap=300):
+def _engine(tmp_path, cap=300, ema9_buffer_points=0.0):
     return SensexPaperEngine(
         daily_loss_cap=cap,
+        ema9_buffer_points=ema9_buffer_points,
         trades_path=tmp_path / "trades.csv",
         state_path=tmp_path / "state.json",
     )
@@ -140,6 +141,19 @@ def test_paper_entry_resolves_atm_call_and_uses_contract_lot_and_option_ltp(tmp_
     assert "Entry: ₹177.70" in notifier.messages[0]
 
 
+def test_paper_entry_applies_configured_ema9_buffer(tmp_path):
+    engine = _engine(tmp_path, ema9_buffer_points=3.0)
+    api = _FakeAPI()
+    notifier = _FakeNotifier()
+
+    _enter_position(engine, api, notifier, ema9=900.0)
+
+    assert engine.position is not None
+    assert engine.position.trailing_stop == 897.0
+    state = json.loads(engine.state_path.read_text(encoding="utf-8"))
+    assert state["ema9_buffer_points"] == 3.0
+
+
 def test_paper_minute_ohlc_touch_uses_prior_ema_and_option_ltp_for_rupee_pnl(tmp_path):
     engine = _engine(tmp_path)
     api = _FakeAPI(option_price=177.70)
@@ -169,6 +183,30 @@ def test_paper_minute_ohlc_touch_uses_prior_ema_and_option_ltp_for_rupee_pnl(tmp
     assert trade["exit_time"] == "2026-01-01T09:26:00+05:30"
     assert "SELL SENSEX-Jan2026-80000-CE" in notifier.messages[-1]
     assert "-₹764.00" in notifier.messages[-1]
+
+
+def test_paper_minute_touch_uses_buffered_prior_ema9(tmp_path):
+    engine = _engine(tmp_path, ema9_buffer_points=3.0)
+    api = _FakeAPI(option_price=177.70)
+    api.quote_prices.extend([177.70, 139.50])
+    notifier = _FakeNotifier()
+    _enter_position(engine, api, notifier, ema9=900.0)
+
+    engine.process_completed_bars(
+        _bars(close=1000.0),
+        _minutes(first_low=896.0),
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 1),
+        now=pd.Timestamp("2026-01-01T09:30:00+05:30").to_pydatetime(),
+        signal_logic=_FakeSignalLogic,
+        strategy_config=object(),
+        api=api,
+        notifier=notifier,
+    )
+
+    trade = pd.read_csv(engine.trades_path).iloc[0]
+    assert trade["exit_reason"] == "EMA9_TOUCH"
+    assert trade["exit_index"] == 897.0
 
 
 def test_minute_ohlc_gap_through_fills_at_minute_open_and_ignores_incomplete_minute(tmp_path):
@@ -246,12 +284,25 @@ def test_paper_state_restores_contract_and_rejects_changed_cap(tmp_path):
         )
 
 
+def test_paper_state_rejects_changed_ema9_buffer(tmp_path):
+    engine = _engine(tmp_path, ema9_buffer_points=3.0)
+    engine.save_state()
+
+    with pytest.raises(RuntimeError, match="EMA9 buffer differs"):
+        SensexPaperEngine(
+            daily_loss_cap=300,
+            ema9_buffer_points=6.0,
+            trades_path=tmp_path / "trades.csv",
+            state_path=tmp_path / "state.json",
+        )
+
+
 def test_state_file_contains_no_option_order_execution_fields(tmp_path):
     engine = _engine(tmp_path)
     engine.save_state()
 
     state = json.loads(engine.state_path.read_text(encoding="utf-8"))
-    assert state["version"] == 2
+    assert state["version"] == 3
     assert "orders" not in state
 
 

@@ -101,12 +101,15 @@ def replay_sensex_touch_cap(
     start: date,
     end: date,
     daily_loss_cap: float,
+    ema9_buffer_points: float = 0.0,
     signal_logic: Any,
     strategy_config: Any,
 ) -> pd.DataFrame:
     """Replay EMA9 touch exits with five-minute-close trail and daily-cap checks."""
     if not math.isfinite(daily_loss_cap) or daily_loss_cap <= 0:
         raise ValueError("daily_loss_cap must be positive and finite.")
+    if not math.isfinite(ema9_buffer_points) or ema9_buffer_points < 0:
+        raise ValueError("ema9_buffer_points must be finite and non-negative.")
     if enriched_bars.empty:
         raise ValueError("No completed SENSEX five-minute bars are available.")
 
@@ -176,9 +179,11 @@ def replay_sensex_touch_cap(
 
         if position is not None and bar_index > position["entry_bar_index"]:
             prior_ema9 = float(enriched_bars.iloc[bar_index - 1]["ema9"]) if bar_index > 0 else np.nan
+            direction = 1.0 if position["signal"] == "ENTER_LONG" else -1.0
+            prior_stop = prior_ema9 - direction * ema9_buffer_points
 
             # 1. Intra-bar checks (EMA9 Touch via minute data)
-            if minute_group is not None and math.isfinite(prior_ema9):
+            if minute_group is not None and math.isfinite(prior_stop):
                 for minute in minute_group.itertuples(index=False):
                     if position is None:
                         break
@@ -186,11 +191,11 @@ def replay_sensex_touch_cap(
                         continue
 
                     minute_close_time = minute.timestamp + pd.Timedelta(minutes=1)
-                    if position["signal"] == "ENTER_LONG" and float(minute.low) <= prior_ema9:
-                        fill = float(minute.open) if float(minute.open) <= prior_ema9 else prior_ema9
+                    if position["signal"] == "ENTER_LONG" and float(minute.low) <= prior_stop:
+                        fill = float(minute.open) if float(minute.open) <= prior_stop else prior_stop
                         close_position(minute_close_time, fill, "EMA9_TOUCH")
-                    elif position["signal"] == "ENTER_SHORT" and float(minute.high) >= prior_ema9:
-                        fill = float(minute.open) if float(minute.open) >= prior_ema9 else prior_ema9
+                    elif position["signal"] == "ENTER_SHORT" and float(minute.high) >= prior_stop:
+                        fill = float(minute.open) if float(minute.open) >= prior_stop else prior_stop
                         close_position(minute_close_time, fill, "EMA9_TOUCH")
 
             # 2. End-of-bar checks (Trail, Cap, Square-off) evaluated sequentially at the 5-min close
@@ -213,8 +218,11 @@ def replay_sensex_touch_cap(
                         # Ratchet trailing stop for the next candle if position survives
                         current_ema9 = float(bar["ema9"])
                         if math.isfinite(current_ema9):
+                            buffered_ema9 = current_ema9 - direction * ema9_buffer_points
                             position["trailing_stop"] = (
-                                max(trailing_stop, current_ema9) if direction > 0 else min(trailing_stop, current_ema9)
+                                max(trailing_stop, buffered_ema9)
+                                if direction > 0
+                                else min(trailing_stop, buffered_ema9)
                             )
 
         if position is not None or position_open_at_bar_start:
@@ -233,13 +241,14 @@ def replay_sensex_touch_cap(
         entry_ema9 = float(bar["ema9"])
         if not math.isfinite(entry_ema9):
             raise RuntimeError(f"Missing SENSEX EMA9 at entry time {bar_start}.")
+        direction = 1.0 if decision.action == "ENTER_LONG" else -1.0
         position = {
             "signal_bar_start": bar_start,
             "entry_time": bar_close_time,
             "signal": decision.action,
             "entry_price": float(bar["close"]),
             "entry_bar_index": bar_index,
-            "trailing_stop": entry_ema9,
+            "trailing_stop": entry_ema9 - direction * ema9_buffer_points,
         }
 
     if position is not None:
@@ -247,7 +256,7 @@ def replay_sensex_touch_cap(
     return pd.DataFrame(trades)
 
 
-def _trade_metrics(trades: pd.DataFrame, cap: float) -> dict[str, Any]:
+def _trade_metrics(trades: pd.DataFrame, cap: float, ema9_buffer_points: float = 0.0) -> dict[str, Any]:
     points = pd.to_numeric(trades["index_points"], errors="raise")
     equity = points.cumsum()
     # Fixed drawdown calculation to yield a positive magnitude
@@ -263,6 +272,7 @@ def _trade_metrics(trades: pd.DataFrame, cap: float) -> dict[str, Any]:
         "cap_hit_days": int(cap_exit_days),
         "exit_counts": trades["exit_reason"].value_counts().to_dict(),
         "cap": cap,
+        "ema9_buffer_points": ema9_buffer_points,
     }
 
 
@@ -278,6 +288,8 @@ def _write_report(
 ) -> tuple[Path, Path]:
     output_dir = ROOT_DIR / "Backtest Outputs"
     stem = f"fyers_ema_sensex_{start:%Y%m%d}_{end:%Y%m%d}_touch_cap{metrics['cap']:g}_5m_close"
+    if metrics["ema9_buffer_points"] > 0:
+        stem += f"_ema9buffer{metrics['ema9_buffer_points']:g}"
     trades_path = output_dir / f"{stem}_trades.csv"
     summary_path = output_dir / f"{stem}_summary.txt"
     trades.to_csv(trades_path, index=False)
@@ -290,12 +302,14 @@ def _write_report(
             "before treating the cap comparison as verified."
         ),
         (
-            "EMA9 touch: one-minute OHLC against the prior completed five-minute EMA9; threshold fill "
-            "adjusted to minute open if gapped through."
+            f"EMA9 touch: one-minute OHLC against the prior completed five-minute EMA9 with a "
+            f"{metrics['ema9_buffer_points']:g}-point directional buffer; threshold fill adjusted to "
+            "minute open if gapped through."
         ),
         (
-            "EMA9 trailing stop starts at entry signal-bar EMA9; existing stop is checked on completed "
-            "five-minute close, then EMA9 is ratcheted for the next close."
+            f"EMA9 trailing stop starts at entry signal-bar EMA9 with a "
+            f"{metrics['ema9_buffer_points']:g}-point directional buffer; existing stop is checked on "
+            "completed five-minute close, then buffered EMA9 is ratcheted for the next close."
         ),
         (
             f"Daily cap: realized plus close-based open points checked at each completed five-minute "
@@ -388,6 +402,12 @@ def main(argv: list[str] | None = None) -> int:
         default=list(DEFAULT_CAPS),
         help="One or more daily loss caps in index points (default: 250 300).",
     )
+    parser.add_argument(
+        "--ema9-buffer-points",
+        type=float,
+        default=3.0,
+        help="Move LONG EMA9 stops down and SHORT EMA9 stops up by this many points (default: 3).",
+    )
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--refresh-cache", action="store_true", help="Fetch again and replace cached requests.")
     cache_group.add_argument("--no-cache", action="store_true", help="Fetch without reading or writing local cache.")
@@ -398,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--caps values must be positive finite point amounts.")
     if len(set(args.caps)) != len(args.caps):
         parser.error("--caps must not contain duplicates.")
+    if not math.isfinite(args.ema9_buffer_points) or args.ema9_buffer_points < 0:
+        parser.error("--ema9-buffer-points must be finite and non-negative.")
 
     minute_history, cache = fetch_minute_history(
         args.start_date,
@@ -436,11 +458,12 @@ def main(argv: list[str] | None = None) -> int:
             start=args.start_date,
             end=args.end_date,
             daily_loss_cap=cap,
+            ema9_buffer_points=args.ema9_buffer_points,
             signal_logic=logic,
             strategy_config=config,
         )
         results[cap] = trades
-        metrics = _trade_metrics(trades, cap)
+        metrics = _trade_metrics(trades, cap, args.ema9_buffer_points)
         _, summary_path = _write_report(
             trades,
             start=args.start_date,

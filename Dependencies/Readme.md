@@ -92,8 +92,13 @@ Signals use completed five-minute candles. LONG buys the nearest-expiry ATM CE;
 SHORT buys the nearest-expiry ATM PE. The selected contract's official lot size
 is used for one lot, and option entries/exits are paper-marked at live LTP.
 EMA9-touch exits follow the historical replay rule: check each completed
-one-minute SENSEX candle against the prior completed five-minute EMA9; if a
-candle gaps through that level, use its open, otherwise use the EMA9 threshold.
+one-minute SENSEX candle against the prior completed five-minute EMA9 adjusted
+by the configured buffer; with the default 3-point buffer, LONG stops are 3
+points below EMA9 and SHORT stops are 3 points above it. If a candle gaps
+through the buffered level, use its open, otherwise use that level. The
+five-minute trailing stop starts at the similarly buffered entry-bar EMA9 and
+ratchets in the trade's favorable direction. The buffer defaults to 3 points
+and can be changed with `SENSEX_PAPER_EMA9_BUFFER_POINTS` or `--ema9-buffer-points`.
 Trailing stop and the 300-point daily loss cap are checked at completed
 five-minute closes, in the same order as the replay. These triggers use the
 SENSEX index, not option premium. Option rupee P&L uses option LTP snapshots, so
@@ -102,6 +107,13 @@ verify them. The index-point cap counts realized plus open directional index
 points at completed five-minute closes; it is not a rupee loss limit, and gaps
 can exceed it. Telegram alerts use the existing
 `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` configuration.
+
+To test stop spacing in the historical index replay, run
+`python "Dependencies/fyers_sensex_touch_replay.py" --caps 300 --ema9-buffer-points 3`.
+The buffer is applied below EMA9 for LONG stops and above EMA9 for SHORT stops,
+including the initial stop, each five-minute trailing update, and one-minute
+touch exits. The replay defaults to 3 points to match the paper runner; pass
+`--ema9-buffer-points 0` to reproduce the original unbuffered replay.
 
 For a server deployment, set `LIVE_TRADING_ENABLED=false`,
 `TELEGRAM_ENABLED=true`, and persist the token, ledger, and state on a durable
