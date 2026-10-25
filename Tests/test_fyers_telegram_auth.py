@@ -81,6 +81,20 @@ def test_daily_authentication_skips_weekends(now):
     )
 
 
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (datetime(2026, 10, 26, 9, 14, tzinfo=IST), True),
+        (datetime(2026, 10, 26, 9, 15, tzinfo=IST), False),
+        (datetime(2026, 10, 26, 15, 19, tzinfo=IST), False),
+        (datetime(2026, 10, 26, 15, 20, tzinfo=IST), True),
+        (datetime(2026, 10, 25, 12, 0, tzinfo=IST), True),
+    ],
+)
+def test_dashboard_backtest_window_avoids_weekday_market_session(now, expected):
+    assert auth.dashboard_backtest_allowed_at(now) is expected
+
+
 def test_daily_authentication_scheduler_requests_a_fresh_link(monkeypatch, tmp_path):
     service = _service(tmp_path)
     request_auth = Mock(side_effect=lambda _reason: service._stop_event.set())
@@ -345,6 +359,72 @@ def test_dashboard_is_public_read_only_when_enabled(tmp_path):
         assert api_status == 200
         assert json.loads(api_body) == {"service": {"status": "RUNNING"}, "position": None}
         assert post_status == 405
+    finally:
+        service._httpd.shutdown()
+        service._httpd.server_close()
+        server_thread.join(timeout=2)
+
+
+def test_dashboard_backtest_runs_without_token_in_background(tmp_path, monkeypatch):
+    today = datetime.now(IST).date()
+    monkeypatch.setattr(auth, "dashboard_backtest_allowed_at", lambda _now: True)
+    service = auth.FyersTelegramAuthService(
+        bot_token="bot-token",
+        authorized_chat_id="12345",
+        client_id="app-id",
+        secret_key="app-secret",
+        redirect_uri="https://service.example/callback/",
+        token_file=tmp_path / "token",
+        market_data_client=_FakeMarketDataClient(),
+        port=_unused_port(),
+        dashboard_state=Mock(snapshot=lambda: {"service": {"instrument": "SENSEX"}}),
+        dashboard_enabled=True,
+        dashboard_backtest_runner=lambda start, end: {
+            "instrument": "SENSEX",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "trades": [],
+        },
+    )
+    server_thread = threading.Thread(target=service._httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    def request(path, *, method="GET", body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", service.port, timeout=3)
+        connection.request(method, path, body=body, headers=headers or {})
+        response = connection.getresponse()
+        content = response.read()
+        status = response.status
+        connection.close()
+        return status, content
+
+    payload = json.dumps(
+        {"start_date": today.isoformat(), "end_date": today.isoformat()}
+    )
+    try:
+        page_status, page = request("/backtest")
+        accepted_status, accepted_body = request(
+            "/api/backtest",
+            method="POST",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert page_status == 200
+        assert b'type="date"' in page
+        assert accepted_status == 202
+        job = json.loads(accepted_body)
+        assert job["status"] in {"RUNNING", "COMPLETED"}
+
+        for _ in range(100):
+            status, body = request(f"/api/backtest/{job['id']}")
+            assert status == 200
+            job = json.loads(body)
+            if job["status"] != "RUNNING":
+                break
+            threading.Event().wait(0.01)
+        assert job["status"] == "COMPLETED"
+        assert job["result"]["instrument"] == "SENSEX"
     finally:
         service._httpd.shutdown()
         service._httpd.server_close()

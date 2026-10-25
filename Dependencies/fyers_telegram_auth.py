@@ -10,16 +10,18 @@ import stat
 import tempfile
 import threading
 import time
-from datetime import datetime, time as day_time, timedelta
+from datetime import date, datetime, time as day_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse, urlsplit
+from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfo
 
 import requests
 
 from Dependencies.fyers_api import FyersAPI, FyersAPIError, build_auth_url, exchange_auth_code
+from Dependencies.fyers_dashboard_backtest import DashboardBacktestJobs
 
 LOGGER = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org"
@@ -27,6 +29,8 @@ AUTH_CODE_TTL_SECONDS = 10 * 60
 SESSION_CHECK_INTERVAL_SECONDS = 5 * 60
 AUTHENTICATION_TIME = day_time(9, 0)
 IST = ZoneInfo("Asia/Kolkata")
+BACKTEST_BLOCK_START = day_time(9, 15)
+BACKTEST_BLOCK_END = day_time(15, 20)
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 HTTP_TIMEOUT_SECONDS = (5.0, 30.0)
 DASHBOARD_ASSETS_DIR = Path(__file__).resolve().parent / "dashboard_assets"
@@ -34,6 +38,9 @@ DASHBOARD_ASSET_ROUTES = {
     "/": ("fyers_dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.css": ("fyers_dashboard.css", "text/css; charset=utf-8"),
     "/dashboard.js": ("fyers_dashboard.js", "text/javascript; charset=utf-8"),
+    "/backtest": ("fyers_backtest.html", "text/html; charset=utf-8"),
+    "/backtest.css": ("fyers_backtest.css", "text/css; charset=utf-8"),
+    "/backtest.js": ("fyers_backtest.js", "text/javascript; charset=utf-8"),
     "/vendor/lightweight-charts.standalone.production.js": (
         "vendor/lightweight-charts.standalone.production.js",
         "text/javascript; charset=utf-8",
@@ -51,6 +58,14 @@ def next_daily_authentication_at(now: datetime) -> datetime:
             return candidate
         candidate_date += timedelta(days=1)
     raise RuntimeError("Unable to find the next weekday Fyers authentication time.")
+
+
+def dashboard_backtest_allowed_at(now: datetime) -> bool:
+    local_now = now.astimezone(IST)
+    return not (
+        local_now.weekday() < 5
+        and BACKTEST_BLOCK_START <= local_now.time() < BACKTEST_BLOCK_END
+    )
 
 
 def load_persisted_access_token(token_file: Path, fallback: str = "") -> str:
@@ -146,6 +161,7 @@ class FyersTelegramAuthService:
         port: int,
         dashboard_state: Any | None = None,
         dashboard_enabled: bool = False,
+        dashboard_backtest_runner: Callable[[date, date], dict[str, Any]] | None = None,
     ) -> None:
         parsed_redirect = urlparse(redirect_uri)
         callback_path = parsed_redirect.path.rstrip("/") or "/"
@@ -179,6 +195,11 @@ class FyersTelegramAuthService:
         self.port = port
         self.dashboard_enabled = dashboard_enabled
         self.dashboard_state = dashboard_state
+        self.dashboard_backtest_jobs = (
+            DashboardBacktestJobs(dashboard_backtest_runner)
+            if dashboard_enabled and dashboard_backtest_runner
+            else None
+        )
         self._dashboard_assets = (
             {
                 route: (path.read_bytes(), content_type)
@@ -247,7 +268,12 @@ class FyersTelegramAuthService:
                 self.wfile.write(body)
 
             def _dashboard(self, request_path: str) -> bool:
-                if request_path not in DASHBOARD_ASSET_ROUTES and request_path != "/api/dashboard":
+                is_job_status = request_path.startswith("/api/backtest/")
+                if (
+                    request_path not in DASHBOARD_ASSET_ROUTES
+                    and request_path != "/api/dashboard"
+                    and not is_job_status
+                ):
                     return False
                 if not service.dashboard_enabled:
                     self._respond(404, "Not found.")
@@ -260,9 +286,66 @@ class FyersTelegramAuthService:
                     ).encode("utf-8")
                     self._respond_bytes(200, body, "application/json; charset=utf-8")
                     return True
+                if is_job_status:
+                    if not service.dashboard_backtest_jobs:
+                        self._respond(404, "Backtests are disabled.")
+                        return True
+                    job_id = request_path.removeprefix("/api/backtest/")
+                    job = service.dashboard_backtest_jobs.get(job_id)
+                    if job is None:
+                        self._respond(404, "Backtest job not found.")
+                        return True
+                    body = json.dumps(job, allow_nan=False, separators=(",", ":"), default=str).encode()
+                    self._respond_bytes(200, body, "application/json; charset=utf-8")
+                    return True
                 body, content_type = service._dashboard_assets[request_path]
                 self._respond_bytes(200, body, content_type)
                 return True
+
+            def _start_backtest(self) -> None:
+                if not service.dashboard_enabled or service.dashboard_backtest_jobs is None:
+                    self._respond(404, "Dashboard backtests are disabled.")
+                    return
+                if not dashboard_backtest_allowed_at(datetime.now(IST)):
+                    self._respond(
+                        409,
+                        "Dashboard backtests are available outside the weekday market session only.",
+                    )
+                    return
+                if self.headers.get_content_type() != "application/json":
+                    self._respond(415, "Send a JSON request.")
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                    if not 1 <= content_length <= 4096:
+                        raise ValueError
+                    payload = json.loads(self.rfile.read(content_length))
+                    if not isinstance(payload, dict) or set(payload) != {
+                        "start_date",
+                        "end_date",
+                    }:
+                        raise ValueError
+                    start_text = payload["start_date"]
+                    end_text = payload["end_date"]
+                    if not isinstance(start_text, str) or not isinstance(end_text, str):
+                        raise ValueError
+                    start = date.fromisoformat(start_text)
+                    end = date.fromisoformat(end_text)
+                    if start.isoformat() != start_text or end.isoformat() != end_text:
+                        raise ValueError
+                    today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+                    if start > end or end > today_ist:
+                        raise ValueError
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    self._respond(400, "Provide valid start_date and end_date; end_date cannot be future.")
+                    return
+                job, accepted = service.dashboard_backtest_jobs.submit(start, end)
+                body = json.dumps(job, allow_nan=False, separators=(",", ":"), default=str).encode()
+                self._respond_bytes(
+                    202 if accepted else 409,
+                    body,
+                    "application/json; charset=utf-8",
+                )
 
             def do_GET(self) -> None:
                 request_path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -286,7 +369,11 @@ class FyersTelegramAuthService:
                 self._respond(200, "Fyers authentication completed. You can return to Telegram.")
 
             def do_POST(self) -> None:
-                self._respond(405, "Method not allowed.")
+                request_path = urlsplit(self.path).path.rstrip("/") or "/"
+                if request_path == "/api/backtest":
+                    self._start_backtest()
+                else:
+                    self._respond(405, "Method not allowed.")
 
         return ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
 

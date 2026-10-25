@@ -13,10 +13,11 @@
       <div class="sigil" aria-hidden="true">N</div>
       <div>
         <div class="wordmark">NIGHTWATCH <span>///</span> TRADING SYSTEMS</div>
-        <div class="submark">NIFTY · EMA TREND ENGINE</div>
+        <div id="instrument-name" class="submark">EMA9 TREND ENGINE</div>
       </div>
     </div>
     <div class="top-status">
+      <a id="backtest-link" class="mode-tag" href="/backtest">BACKTEST</a>
       <span id="mode" class="mode-tag">PAPER</span>
       <span id="service-status" class="service-state"><i></i> CONNECTING</span>
       <span id="clock" class="clock">--:--:-- IST</span>
@@ -52,7 +53,7 @@
         <div class="panel-head chart-head">
           <div>
             <div class="eyebrow">MARKET STRUCTURE <span class="accent">/</span> 5 MIN</div>
-            <h1>NIFTY <span id="spot-price">--</span></h1>
+            <h1><span id="underlying-name">INDEX</span> <span id="spot-price">--</span></h1>
           </div>
           <div class="chart-meta">
             <span id="bar-time">WAITING FOR BARS</span>
@@ -66,7 +67,7 @@
           <span class="chart-source">FYERS MARKET DATA</span>
         </div>
         <div class="chart-wrap">
-          <div id="price-chart" role="img" aria-label="NIFTY five-minute candlestick chart"></div>
+          <div id="price-chart" role="img" aria-label="Index five-minute candlestick chart"></div>
           <div id="chart-empty" class="chart-empty">AWAITING LIVE MARKET DATA</div>
         </div>
       </article>

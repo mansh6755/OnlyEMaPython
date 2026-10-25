@@ -4,6 +4,8 @@
   const byId = (id) => document.getElementById(id);
   const view = {
     mode: byId("mode"),
+    instrument: byId("instrument-name"),
+    backtestLink: byId("backtest-link"),
     service: byId("service-status"),
     clock: byId("clock"),
     sessionDate: byId("session-date"),
@@ -15,6 +17,7 @@
     lossLimit: byId("loss-limit"),
     riskFill: byId("risk-fill"),
     spot: byId("spot-price"),
+    underlyingName: byId("underlying-name"),
     barTime: byId("bar-time"),
     feedState: byId("feed-state"),
     chart: byId("price-chart"),
@@ -188,6 +191,14 @@
     view.clock.textContent = `${now.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false })} IST`;
     view.mode.textContent = service.mode || "PAPER";
     view.mode.classList.toggle("live", service.mode === "LIVE");
+    const instrumentName = service.instrument
+      || (String(service.underlying || "").includes("SENSEX") ? "SENSEX" : "NIFTY");
+    const ema9Forward = service.strategy === "EMA9";
+    view.instrument.textContent = ema9Forward
+      ? `${instrumentName} · EMA9 FORWARD TEST`
+      : `${instrumentName} · EMA TREND ENGINE`;
+    view.underlyingName.textContent = instrumentName;
+    view.backtestLink.hidden = !ema9Forward;
     view.sessionDate.textContent = service.trading_day || "SESSION / --";
     view.service.className = "service-state";
     const serviceDot = document.createElement("i");

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 import talib
 
 from Dependencies.fyers_nifty_ema9_touch_backtest import (
@@ -12,7 +13,9 @@ from Dependencies.fyers_nifty_ema9_touch_backtest import (
     _select_itm_contract,
     replay_ema9_touch_index,
 )
+from Dependencies.fyers_option_backtest import _archived_option_rows
 from Dependencies.fyers_options import FyersOptionContract
+from Dependencies import fyers_nifty_ema9_touch_backtest as backtest_module
 
 
 class _SignalLogic:
@@ -30,7 +33,8 @@ class _SignalLogic:
         return bars.copy()
 
 
-def test_replay_exits_long_at_prior_five_minute_ema9_buffer_on_minute_touch():
+@pytest.mark.parametrize("instrument", ["NIFTY", "SENSEX"])
+def test_replay_exits_long_at_prior_five_minute_ema9_buffer_on_minute_touch(instrument):
     five_minute = pd.DataFrame(
         {
             "timestamp": pd.date_range(
@@ -75,6 +79,7 @@ def test_replay_exits_long_at_prior_five_minute_ema9_buffer_on_minute_touch():
         minute_bars=minutes,
         start=date(2026, 10, 19),
         end=date(2026, 10, 19),
+        instrument=instrument,
     )
 
     assert len(trades) == 1
@@ -83,6 +88,97 @@ def test_replay_exits_long_at_prior_five_minute_ema9_buffer_on_minute_touch():
     assert trades[0]["entry_time"] == "2026-10-19T10:05:00+05:30"
     assert trades[0]["exit_time"] == "2026-10-19T10:06:00+05:30"
     assert trades[0]["exit_index"] == prior_stop
+
+
+def test_archived_option_symbols_parse_for_sensex_expiry():
+    expiry = date(2026, 10, 29)
+
+    rows = _archived_option_rows(
+        [
+            "BSE:SENSEX26OCT2986000CE",
+            "BSE:SENSEX26OCT2986000PE",
+        ],
+        expiry,
+        20,
+        underlying="SENSEX",
+    )
+
+    assert [(row["option_type"], row["strike_price"]) for row in rows] == [
+        ("CE", 86000.0),
+        ("PE", 86000.0),
+    ]
+
+
+def test_backtest_routes_sensex_to_bse_market_data(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeCache:
+        hits = 0
+        misses = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FakeApi:
+        def option_master(self, exchange):
+            calls["exchange"] = exchange
+            return [
+                {
+                    "underlying": "SENSEX",
+                    "option_type": "CE",
+                    "expiry": int(datetime(2026, 10, 29, tzinfo=UTC).timestamp()),
+                    "lot_size": 20,
+                }
+            ]
+
+    monkeypatch.setattr(backtest_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(backtest_module, "FyersHistoryCache", FakeCache)
+    monkeypatch.setattr(
+        backtest_module,
+        "_fetch_index_history_with_cache",
+        lambda _api, _start, _end, _cache, **kwargs: calls.update(
+            index_symbol=kwargs["index_symbol"]
+        )
+        or pd.DataFrame(),
+    )
+    monkeypatch.setattr(backtest_module, "_completed_five_minute_bars", lambda _bars: pd.DataFrame())
+    monkeypatch.setattr(
+        backtest_module,
+        "replay_ema9_touch_index",
+        lambda **kwargs: calls.update(replay_instrument=kwargs["instrument"]) or [],
+    )
+    monkeypatch.setattr(backtest_module, "_fetch_expiry_dates", lambda *_args, **kwargs: [])
+    monkeypatch.setattr(
+        backtest_module,
+        "attach_option_prices",
+        lambda _trades, **kwargs: (
+            calls.update(
+                active_underlying=kwargs["underlying"],
+                history_symbol=kwargs["index_symbol"],
+            )
+            or pd.DataFrame(),
+            {"missing_option_data": 0, "daily_loss_halts": 0},
+        ),
+    )
+
+    trades, _counters, index_trades = backtest_module.run_backtest(
+        FakeApi(),
+        signal_logic=None,
+        strategy_config=None,
+        start=date(2026, 10, 19),
+        end=date(2026, 10, 23),
+        instrument="SENSEX",
+    )
+
+    assert trades.empty
+    assert index_trades == 0
+    assert calls == {
+        "index_symbol": "BSE:SENSEX-INDEX",
+        "replay_instrument": "SENSEX",
+        "exchange": "BSE",
+        "active_underlying": "SENSEX",
+        "history_symbol": "BSE:SENSEX-INDEX",
+    }
 
 
 def test_select_itm_contract_uses_nearest_upcoming_expiry_and_two_itm_steps():

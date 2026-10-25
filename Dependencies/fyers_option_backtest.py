@@ -76,12 +76,20 @@ def _expiry_from_active_row(value: Any) -> date:
     return datetime.fromtimestamp(int(value), tz=ZoneInfo("UTC")).date()
 
 
-def _archived_option_rows(symbols: list[str], expiry: date, lot_size: int) -> list[dict[str, Any]]:
+def _archived_option_rows(
+    symbols: list[str],
+    expiry: date,
+    lot_size: int,
+    *,
+    underlying: str = "NIFTY",
+) -> list[dict[str, Any]]:
     rows = []
+    underlying = underlying.strip().upper()
     prefixes = (
-        f"NIFTY{expiry:%y}{expiry.month}{expiry:%d}",
-        f"NIFTY{expiry:%y}{expiry.strftime('%b')[0].upper()}{expiry:%d}",
-        f"NIFTY{expiry:%y}{expiry.strftime('%b').upper()}",
+        f"{underlying}{expiry:%y}{expiry.month}{expiry:%d}",
+        f"{underlying}{expiry:%y}{expiry.strftime('%b')[0].upper()}{expiry:%d}",
+        f"{underlying}{expiry:%y}{expiry.strftime('%b').upper()}{expiry:%d}",
+        f"{underlying}{expiry:%y}{expiry.strftime('%b').upper()}",
     )
     for symbol in symbols:
         normalized = symbol.strip().upper()
@@ -143,10 +151,18 @@ def _fetch_index_history(
     return history.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
 
 
-def _fetch_expiry_dates(api: FyersAPI, start: date, end: date) -> list[date]:
+def _fetch_expiry_dates(
+    api: FyersAPI,
+    start: date,
+    end: date,
+    *,
+    underlying_symbol: str = UNDERLYING_SYMBOL,
+) -> list[date]:
     expiries = set()
     for chunk_start, chunk_end in _date_chunks(start, end):
-        expiries.update(api.expired_option_expiries(UNDERLYING_SYMBOL, chunk_start, chunk_end))
+        expiries.update(
+            api.expired_option_expiries(underlying_symbol, chunk_start, chunk_end)
+        )
     return sorted(expiries)
 
 

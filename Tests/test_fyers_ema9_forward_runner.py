@@ -6,6 +6,7 @@ import pytest
 
 from Dependencies.fyers_api import FyersAPIError
 from Dependencies.broker_contract import OrderStatus
+from Dependencies.fyers_dashboard_state import FyersDashboardState
 from Dependencies.fyers_ema9_forward_launcher import selected_instrument
 from Dependencies.fyers_ema9_forward_runner import (
     EMA9ForwardRunner,
@@ -312,7 +313,9 @@ class _SignalLogic:
         return bars.copy()
 
 
-def _forward_runner(tmp_path, api, execution, *, mode="PAPER", notifier=None):
+def _forward_runner(
+    tmp_path, api, execution, *, mode="PAPER", notifier=None, dashboard_state=None
+):
     return EMA9ForwardRunner(
         api=api,
         execution=execution,
@@ -323,10 +326,44 @@ def _forward_runner(tmp_path, api, execution, *, mode="PAPER", notifier=None):
         state_path=tmp_path / "state.json",
         trades_path=tmp_path / "trades.csv",
         notifier=notifier,
+        dashboard_state=dashboard_state,
         signal_logic=_SignalLogic,
         strategy_config=_SignalLogic.EMATrendConfig(),
         daily_loss_cap=80,
     )
+
+
+def test_dashboard_snapshot_reflects_open_option_mark_and_pnl(tmp_path):
+    dashboard_state = FyersDashboardState()
+    runner = _forward_runner(
+        tmp_path,
+        _FakeApi(),
+        _NoOrderExecution(),
+        dashboard_state=dashboard_state,
+    )
+    now = datetime(2026, 10, 8, 10, 0, tzinfo=IST)
+    runner.daily_realized_option_pnl = 25
+    runner.position = ForwardPosition(
+        trade_id="dashboard-trade",
+        signal="ENTER_LONG",
+        signal_bar_start=now.isoformat(),
+        entry_time=now.isoformat(),
+        entry_index=1000,
+        trailing_stop=997,
+        contract=FyersOptionContract(
+            "NSE:NIFTY-CE-1000", now.date() + timedelta(days=7), "CE", 1000, 1
+        ),
+        quantity=2,
+        entry_option_price=100,
+    )
+
+    runner._update_dashboard_position(mark_price=110, open_pnl=20)
+    snapshot = dashboard_state.snapshot()
+
+    assert snapshot["position"]["mark_price"] == 110
+    assert snapshot["position"]["open_pnl"] == 20
+    assert snapshot["account"]["realized_pnl"] == 25
+    assert snapshot["account"]["total_pnl"] == 45
 
 
 def test_paper_entry_uses_itm_contract_without_submitting_an_order(tmp_path):

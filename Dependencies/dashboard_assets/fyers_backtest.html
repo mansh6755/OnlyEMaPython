@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080d13">
+  <title>EMA9 Backtest</title>
+  <link rel="stylesheet" href="/backtest.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="back-link" href="/">← LIVE DASHBOARD</a>
+    <div class="identity">
+      <div class="sigil">N</div>
+      <div>
+        <div class="wordmark">EMA9 <span>///</span> BACKTEST</div>
+        <div id="instrument" class="submark">LOADING ACTIVE INSTRUMENT</div>
+      </div>
+    </div>
+    <span class="quiet-tag">HISTORICAL · PAPER MODEL</span>
+  </header>
+
+  <main>
+    <section class="panel form-panel">
+      <div class="eyebrow">TRADE REPLAY <span>/</span> SELECT DATE RANGE</div>
+      <h1>Backtest <span id="instrument-heading">active strategy</span></h1>
+      <p>Runs the EMA9 + 2-step ITM strategy with one lot and the ₹3,500 daily option loss cap. Historical P&amp;L excludes costs and slippage; option marks and live fills can differ.</p>
+      <form id="backtest-form">
+        <label>Start date<input id="start-date" type="date" required></label>
+        <label>End date<input id="end-date" type="date" required></label>
+        <button id="run-button" type="submit" disabled>RUN BACKTEST</button>
+      </form>
+      <div id="status" class="status" role="status">Choose dates and run a backtest.</div>
+    </section>
+
+    <section id="results" hidden>
+      <div id="summary" class="summary-grid"></div>
+      <article class="panel table-panel">
+        <div class="panel-head">
+          <div class="eyebrow">BACKTEST TRADES</div>
+          <span id="trade-count" class="quiet-tag"></span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>ENTRY</th><th>EXIT</th><th>SIDE</th><th>OPTION</th><th class="num">QTY</th><th class="num">ENTRY ₹</th><th class="num">EXIT ₹</th><th class="num">P&amp;L ₹</th><th>REASON</th></tr></thead>
+            <tbody id="trade-rows"></tbody>
+          </table>
+          <div id="trades-empty" class="table-empty" hidden>NO COMPLETED TRADES IN THIS RANGE</div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <script src="/backtest.js"></script>
+</body>
+</html>

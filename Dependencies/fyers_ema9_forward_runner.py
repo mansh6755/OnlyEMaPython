@@ -30,6 +30,8 @@ if str(ROOT_DIR) not in sys.path:
 from Dependencies.broker_contract import OrderStatus  # noqa: E402
 from Dependencies.fyers_api import FyersAPI, FyersAPIError  # noqa: E402
 from Dependencies.fyers_execution import FyersExecutionClient  # noqa: E402
+from Dependencies.fyers_dashboard_state import FyersDashboardState  # noqa: E402
+from Dependencies.fyers_nifty_ema9_touch_backtest import run_dashboard_backtest  # noqa: E402
 from Dependencies.fyers_option_backtest import _completed_five_minute_bars  # noqa: E402
 from Dependencies.fyers_options import (  # noqa: E402
     FyersOptionContract,
@@ -405,6 +407,7 @@ class EMA9ForwardRunner:
         state_path: Path,
         trades_path: Path,
         notifier: Any | None = None,
+        dashboard_state: FyersDashboardState | None = None,
         signal_logic: Any,
         strategy_config: Any,
         daily_loss_cap: float = DAILY_OPTION_LOSS_CAP,
@@ -423,6 +426,7 @@ class EMA9ForwardRunner:
         self.state_path = state_path
         self.trades_path = trades_path
         self.notifier = notifier
+        self.dashboard_state = dashboard_state
         self.signal_logic = signal_logic
         self.strategy_config = strategy_config
         self.daily_loss_cap = daily_loss_cap
@@ -661,6 +665,28 @@ class EMA9ForwardRunner:
                 mode=self.mode,
             )
         )
+        if self.dashboard_state is not None:
+            self.dashboard_state.set_position(None)
+            self.dashboard_state.record_trade(
+                {
+                    "exit_time": trade["exit_time"],
+                    "direction": direction,
+                    "display_symbol": position.contract.symbol,
+                    "symbol": position.contract.symbol,
+                    "quantity": position.quantity,
+                    "entry_price": trade["entry_option_price"],
+                    "exit_price": trade["exit_option_price"],
+                    "pnl": pnl,
+                    "reason": reason,
+                }
+            )
+            self.dashboard_state.update_account(
+                realized_pnl=self.daily_realized_option_pnl,
+                total_pnl=self.daily_realized_option_pnl,
+                trade_count=self.daily_trade_count,
+                daily_loss_limit=self.daily_loss_cap,
+                open_pnl=0.0,
+            )
 
     def _open_position(
         self,
@@ -705,6 +731,7 @@ class EMA9ForwardRunner:
         )
         self.position = position
         self._save_state()
+        self._update_dashboard_position(mark_price=entry_price, open_pnl=0.0)
         self._notify(
             _format_entry_alert(
                 position,
@@ -747,6 +774,7 @@ class EMA9ForwardRunner:
         now = now.astimezone(IST)
         position = self.position
         if position is None:
+            self._update_dashboard_position()
             return
         if now.time() >= SQUARE_OFF:
             self._close_position(
@@ -768,6 +796,7 @@ class EMA9ForwardRunner:
             )
             return
         open_pnl = (mark - position.entry_option_price) * position.quantity
+        self._update_dashboard_position(mark_price=mark, open_pnl=open_pnl)
         if self.daily_realized_option_pnl + open_pnl <= -self.daily_loss_cap:
             self.daily_loss_halted = True
             self._save_state()
@@ -777,6 +806,49 @@ class EMA9ForwardRunner:
                 reason="OPTION_DAILY_LOSS_CAP",
                 quote_price=mark,
             )
+
+    def _update_dashboard_position(
+        self,
+        *,
+        mark_price: float | None = None,
+        open_pnl: float | None = None,
+    ) -> None:
+        if self.dashboard_state is None:
+            return
+        position = self.position
+        if position is None:
+            displayed_open_pnl = 0.0
+            self.dashboard_state.set_position(None)
+        else:
+            displayed_mark = (
+                position.entry_option_price if mark_price is None else mark_price
+            )
+            displayed_open_pnl = (
+                (displayed_mark - position.entry_option_price) * position.quantity
+                if open_pnl is None
+                else open_pnl
+            )
+            self.dashboard_state.set_position(
+                {
+                    "direction": "LONG" if position.signal == "ENTER_LONG" else "SHORT",
+                    "quantity": position.quantity,
+                    "symbol": position.contract.symbol,
+                    "display_symbol": position.contract.symbol,
+                    "entry_price": position.entry_option_price,
+                    "mark_price": displayed_mark,
+                    "entry_spot": position.entry_index,
+                    "stop_spot": position.trailing_stop,
+                    "opened_at": position.entry_time,
+                    "open_pnl": displayed_open_pnl,
+                }
+            )
+        self.dashboard_state.update_account(
+            realized_pnl=self.daily_realized_option_pnl,
+            open_pnl=displayed_open_pnl,
+            total_pnl=self.daily_realized_option_pnl + displayed_open_pnl,
+            trade_count=self.daily_trade_count,
+            daily_loss_limit=self.daily_loss_cap,
+        )
 
     def send_end_of_day_report(self, *, now: datetime) -> None:
         now = now.astimezone(IST)
@@ -809,6 +881,22 @@ class EMA9ForwardRunner:
     def process_market_data(self, minute_bars: pd.DataFrame, *, now: datetime) -> None:
         now = now.astimezone(IST)
         self._begin_day(now.date())
+        if self.dashboard_state is not None:
+            self.dashboard_state.update_service(
+                status="RUNNING",
+                mode=self.mode,
+                strategy="EMA9",
+                instrument=self.config.name,
+                underlying=self.config.index_symbol,
+                trading_day=now.date().isoformat(),
+                last_loop_at=now.isoformat(),
+            )
+            self.dashboard_state.update_account(
+                realized_pnl=self.daily_realized_option_pnl,
+                total_pnl=self.daily_realized_option_pnl,
+                trade_count=self.daily_trade_count,
+                daily_loss_limit=self.daily_loss_cap,
+            )
         self.check_open_position_risk(now=now)
         self.send_end_of_day_report(now=now)
         if minute_bars.empty:
@@ -828,6 +916,50 @@ class EMA9ForwardRunner:
         enriched = self._enriched_bars(minutes)
         if enriched.empty:
             return
+        if self.dashboard_state is not None:
+            latest = enriched.iloc[-1]
+            def dashboard_number(column: str) -> float | None:
+                value = latest.get(column)
+                if value is None or pd.isna(value):
+                    return None
+                number = float(value)
+                return number if math.isfinite(number) else None
+
+            chart_rows = []
+            for bar in enriched.tail(300).itertuples(index=False):
+                bar_time = _localize_timestamp(bar.timestamp)
+                def chart_number(column: str) -> float | None:
+                    value = getattr(bar, column, None)
+                    if value is None or pd.isna(value):
+                        return None
+                    number = float(value)
+                    return number if math.isfinite(number) else None
+
+                chart_rows.append(
+                    {
+                        "time": int(bar_time.timestamp()),
+                        "open": float(bar.open),
+                        "high": float(bar.high),
+                        "low": float(bar.low),
+                        "close": float(bar.close),
+                        "ema_fast": chart_number("ema_fast"),
+                        "ema_mid": chart_number("ema_mid"),
+                        "ema_slow": chart_number("ema_slow"),
+                    }
+                )
+            self.dashboard_state.update_market(
+                status="OK",
+                underlying=self.config.index_symbol,
+                last_success_at=now.isoformat(),
+                bar_at=_localize_timestamp(latest["timestamp"]).isoformat(),
+                spot=dashboard_number("close"),
+                ema_fast=dashboard_number("ema_fast"),
+                ema_mid=dashboard_number("ema_mid"),
+                ema_slow=dashboard_number("ema_slow"),
+                atr=dashboard_number("atr"),
+                adx=dashboard_number("adx"),
+                candles=chart_rows,
+            )
         today_minutes = minutes[minutes["timestamp"].dt.date == now.date()]
 
         bar_starts = pd.DatetimeIndex(enriched["timestamp"])
@@ -1054,6 +1186,27 @@ def _run_forward_runner(
         token_file, environment.get("FYERS_ACCESS_TOKEN", "")
     )
     api = FyersAPI(app_id, access_token or "telegram-auth-pending")
+    signal_logic = _load_signal_logic()
+    dashboard_state = FyersDashboardState()
+    dashboard_enabled = environment.get("DASHBOARD_ENABLED", "true").strip().lower() == "true"
+    dashboard_state.update_service(
+        status="STARTING",
+        mode=mode,
+        strategy="EMA9",
+        instrument=config.name,
+        underlying=config.index_symbol,
+    )
+
+    def run_dashboard_backtest_for_range(start: date, end: date) -> dict[str, Any]:
+        return run_dashboard_backtest(
+            api,
+            signal_logic,
+            signal_logic.EMATrendConfig(),
+            instrument=config.name,
+            start=start,
+            end=end,
+        )
+
     auth_service = FyersTelegramAuthService(
         bot_token=environment.get("TELEGRAM_BOT_TOKEN", ""),
         authorized_chat_id=environment.get("FYERS_AUTH_TELEGRAM_CHAT_ID", ""),
@@ -1063,9 +1216,11 @@ def _run_forward_runner(
         token_file=token_file,
         market_data_client=api,
         port=int(environment.get("PORT", "8787")),
+        dashboard_state=dashboard_state,
+        dashboard_enabled=dashboard_enabled,
+        dashboard_backtest_runner=run_dashboard_backtest_for_range,
     )
     execution = FyersExecutionClient(api)
-    signal_logic = _load_signal_logic()
     runner = EMA9ForwardRunner(
         api=api,
         execution=execution,
@@ -1074,6 +1229,7 @@ def _run_forward_runner(
         state_path=state_path,
         trades_path=trades_path,
         notifier=notifier,
+        dashboard_state=dashboard_state,
         signal_logic=signal_logic,
         strategy_config=signal_logic.EMATrendConfig(),
     )
@@ -1083,6 +1239,14 @@ def _run_forward_runner(
         if mode == "LIVE":
             _live_preflight(execution, runner)
             _validate_live_resume(runner, now=datetime.now(IST))
+        dashboard_state.update_service(
+            status="RUNNING",
+            mode=mode,
+            strategy="EMA9",
+            instrument=config.name,
+            underlying=config.index_symbol,
+            started_at=datetime.now(IST).isoformat(),
+        )
         notifier.notify(
             "✅ Strategy started successfully · EMA\n"
             f"Mode: {mode}\n"
@@ -1141,6 +1305,7 @@ def _run_forward_runner(
                 runner.process_market_data(minute_bars, now=now)
             except FyersAPIError as exc:
                 market_data_status = "ERROR · market-data request failed"
+                dashboard_state.update_market(status="ERROR")
                 LOGGER.exception("%s EMA9 market-data request failed; retrying.", config.name)
                 _notify_runner_error(
                     notifier,
@@ -1159,6 +1324,7 @@ def _run_forward_runner(
                     )
             except Exception as exc:
                 market_data_status = "ERROR · processing cycle failed"
+                dashboard_state.update_market(status="ERROR")
                 LOGGER.exception("%s EMA9 processing cycle failed.", config.name)
                 _notify_runner_error(
                     notifier,

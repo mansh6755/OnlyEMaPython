@@ -1,4 +1,4 @@
-"""Backtest NIFTY EMA9-touch exits against historical Fyers option candles."""
+"""Backtest NIFTY or SENSEX EMA9-touch exits against historical Fyers candles."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from Dependencies.fyers_options import (  # noqa: E402
     select_nearest_expiry,
 )
 from Dependencies.fyers_history_cache import FyersHistoryCache, HISTORY_COLUMNS  # noqa: E402
+from Dependencies.fyers_dashboard_backtest import summarize_backtest  # noqa: E402
 
 ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
 IST = ZoneInfo("Asia/Kolkata")
@@ -55,12 +56,16 @@ def replay_ema9_touch_index(
     start: date,
     end: date,
     ema9_buffer_points: float = 3.0,
+    instrument: str = "NIFTY",
 ) -> list[dict[str, Any]]:
-    """Replay original NIFTY entries with the SENSEX EMA9 touch/trailing exits."""
+    """Replay the original EMA entries with EMA9 touch/trailing exits."""
+    instrument = instrument.strip().upper()
+    if instrument not in {"NIFTY", "SENSEX"}:
+        raise ValueError("instrument must be NIFTY or SENSEX.")
     if not np.isfinite(ema9_buffer_points) or ema9_buffer_points < 0:
         raise ValueError("ema9_buffer_points must be finite and non-negative.")
     if five_minute_bars.empty:
-        raise ValueError("No complete NIFTY five-minute bars are available.")
+        raise ValueError(f"No complete {instrument} five-minute bars are available.")
     enriched = signal_logic.build_ema_trend_with_indicators(five_minute_bars, strategy_config)
     enriched = enriched.copy()
     enriched["ema9"] = talib.EMA(
@@ -71,11 +76,11 @@ def replay_ema9_touch_index(
     bar_times = pd.to_datetime(enriched["timestamp"], errors="coerce")
     bar_times = bar_times.dt.tz_localize(IST) if bar_times.dt.tz is None else bar_times.dt.tz_convert(IST)
     if bar_times.isna().any():
-        raise ValueError("NIFTY five-minute bars contain invalid timestamps.")
+        raise ValueError(f"{instrument} five-minute bars contain invalid timestamps.")
 
     minutes = minute_bars.copy()
     if "timestamp" not in minutes:
-        raise ValueError("NIFTY minute data is missing its timestamp column.")
+        raise ValueError(f"{instrument} minute data is missing its timestamp column.")
     minutes["timestamp"] = pd.to_datetime(minutes["timestamp"], errors="coerce")
     if minutes["timestamp"].dt.tz is None:
         minutes["timestamp"] = minutes["timestamp"].dt.tz_localize(IST)
@@ -93,7 +98,7 @@ def replay_ema9_touch_index(
     def close_position(at: pd.Timestamp, price: float, reason: str) -> None:
         nonlocal position
         if position is None:
-            raise RuntimeError("Cannot close an absent NIFTY replay position.")
+            raise RuntimeError(f"Cannot close an absent {instrument} replay position.")
         direction = 1.0 if position["signal"] == "ENTER_LONG" else -1.0
         trades.append(
             {
@@ -179,7 +184,7 @@ def replay_ema9_touch_index(
         }
 
     if position is not None:
-        raise RuntimeError("NIFTY EMA9 replay ended with an open position.")
+        raise RuntimeError(f"{instrument} EMA9 replay ended with an open position.")
     return trades
 
 
@@ -188,11 +193,13 @@ def _fetch_index_history_with_cache(
     start: date,
     end: date,
     history_cache: FyersHistoryCache,
+    *,
+    index_symbol: str = UNDERLYING_SYMBOL,
 ) -> pd.DataFrame:
     frames = [
         history_cache.history(
             api,
-            UNDERLYING_SYMBOL,
+            index_symbol,
             resolution="1",
             start=chunk_start,
             end=chunk_end,
@@ -221,16 +228,20 @@ def _select_itm_contract(
     archived_symbols: dict[date, list[str]],
     fallback_lot_size: int,
     strike_steps: int,
+    underlying: str = "NIFTY",
+    index_symbol: str = UNDERLYING_SYMBOL,
 ) -> FyersOptionContract:
     expiry = select_nearest_expiry(expiries, today=trade_day)
     if expiry < date.today():
         if expiry not in archived_symbols:
-            archived_symbols[expiry] = api.expired_option_symbols(UNDERLYING_SYMBOL, expiry)
-        rows = _archived_option_rows(archived_symbols[expiry], expiry, fallback_lot_size)
+            archived_symbols[expiry] = api.expired_option_symbols(index_symbol, expiry)
+        rows = _archived_option_rows(
+            archived_symbols[expiry], expiry, fallback_lot_size, underlying=underlying
+        )
     else:
         rows = []
         for row in active_rows:
-            if row.get("underlying") != "NIFTY" or row.get("option_type") not in {"CE", "PE"}:
+            if row.get("underlying") != underlying or row.get("option_type") not in {"CE", "PE"}:
                 continue
             try:
                 row_expiry = _expiry_from_active_row(row.get("expiry"))
@@ -306,6 +317,8 @@ def attach_option_prices(
     end: date,
     history_cache: FyersHistoryCache,
     strike_steps: int = 2,
+    underlying: str = "NIFTY",
+    index_symbol: str = UNDERLYING_SYMBOL,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Mark trades at completed 5-second closes and enforce the rupee loss cap."""
     if lots <= 0 or strike_steps <= 0:
@@ -317,12 +330,16 @@ def attach_option_prices(
         (
             int(row["lot_size"])
             for row in active_rows
-            if row.get("underlying") == "NIFTY"
+            if row.get("underlying") == underlying
             and row.get("option_type") == "CE"
             and row.get("lot_size")
         ),
-        65,
+        None,
     )
+    if fallback_lot_size is None or fallback_lot_size <= 0:
+        raise RuntimeError(
+            f"Fyers {underlying} option master does not provide a valid lot size."
+        )
     archived_symbols: dict[date, list[str]] = {}
     option_cache: dict[tuple[str, date], pd.DataFrame] = {}
     daily_realized: dict[date, float] = {}
@@ -347,6 +364,8 @@ def attach_option_prices(
                 archived_symbols=archived_symbols,
                 fallback_lot_size=fallback_lot_size,
                 strike_steps=strike_steps,
+                underlying=underlying,
+                index_symbol=index_symbol,
             )
             cache_key = (contract.symbol, trade_day)
             if cache_key not in option_cache:
@@ -435,11 +454,21 @@ def run_backtest(
     end: date,
     *,
     lots: int = 1,
-    daily_loss_cap: float = 5500.0,
+    daily_loss_cap: float = 3500.0,
     strike_steps: int = 2,
     use_cache: bool = True,
     refresh_cache: bool = False,
+    instrument: str = "NIFTY",
+    index_symbol: str | None = None,
+    exchange: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int], int]:
+    instrument = instrument.strip().upper()
+    if instrument not in {"NIFTY", "SENSEX"}:
+        raise ValueError("instrument must be NIFTY or SENSEX.")
+    if index_symbol is None:
+        index_symbol = "NSE:NIFTY50-INDEX" if instrument == "NIFTY" else "BSE:SENSEX-INDEX"
+    if exchange is None:
+        exchange = "NSE" if instrument == "NIFTY" else "BSE"
     history_cache = FyersHistoryCache(
         OUTPUT_DIR / ".fyers_cache",
         enabled=use_cache,
@@ -450,6 +479,7 @@ def run_backtest(
         start - timedelta(days=7),
         end,
         history_cache,
+        index_symbol=index_symbol,
     )
     five_minute_bars = _completed_five_minute_bars(index_minutes)
     index_trades = replay_ema9_touch_index(
@@ -459,12 +489,13 @@ def run_backtest(
         minute_bars=index_minutes,
         start=start,
         end=end,
+        instrument=instrument,
     )
-    active_rows = api.option_master()
+    active_rows = api.option_master(exchange)
     expiry_rows = [
         _expiry_from_active_row(row["expiry"])
         for row in active_rows
-        if row.get("underlying") == "NIFTY"
+        if row.get("underlying") == instrument
         and row.get("option_type") in {"CE", "PE"}
         and row.get("expiry") is not None
     ]
@@ -472,6 +503,7 @@ def run_backtest(
         api,
         start,
         _expired_data_query_end(end, date.today()),
+        underlying_symbol=index_symbol,
     )
     expiries = sorted(set(expiry_rows + archived_expiries))
     trades, counters = attach_option_prices(
@@ -485,10 +517,44 @@ def run_backtest(
         end=end,
         history_cache=history_cache,
         strike_steps=strike_steps,
+        underlying=instrument,
+        index_symbol=index_symbol,
     )
     counters["history_cache_hits"] = history_cache.hits
     counters["history_cache_misses"] = history_cache.misses
     return trades, counters, len(index_trades)
+
+
+def run_dashboard_backtest(
+    api: FyersAPI,
+    signal_logic: Any,
+    strategy_config: Any,
+    *,
+    instrument: str,
+    start: date,
+    end: date,
+) -> dict[str, Any]:
+    instrument = instrument.strip().upper()
+    trades, counters, index_trade_count = run_backtest(
+        api,
+        signal_logic,
+        strategy_config,
+        start,
+        end,
+        lots=1,
+        daily_loss_cap=3500.0,
+        strike_steps=2,
+        instrument=instrument,
+    )
+    return summarize_backtest(
+        trades,
+        counters,
+        index_trade_count,
+        instrument=instrument,
+        start=start,
+        end=end,
+        daily_loss_cap=3500.0,
+    )
 
 
 def write_report(
@@ -501,10 +567,14 @@ def write_report(
     lots: int,
     daily_loss_cap: float,
     strike_steps: int,
+    instrument: str = "NIFTY",
 ) -> tuple[Path, Path]:
+    instrument = instrument.strip().upper()
+    if instrument not in {"NIFTY", "SENSEX"}:
+        raise ValueError("instrument must be NIFTY or SENSEX.")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = (
-        f"nifty_ema9_touch_options_{start:%Y%m%d}_{end:%Y%m%d}_"
+        f"{instrument.lower()}_ema9_touch_options_{start:%Y%m%d}_{end:%Y%m%d}_"
         f"buffer3_cap{daily_loss_cap:g}_{strike_steps}stepITM_{lots}lot"
     )
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
@@ -522,8 +592,8 @@ def write_report(
     else:
         monthly_pnl = pd.Series(dtype=float)
     lines = [
-        f"NIFTY EMA9-touch option backtest: {start} through {end}",
-        "Entries use the original NIFTY EMA4/11/18 signal engine on completed five-minute index bars.",
+        f"{instrument} EMA9-touch option backtest: {start} through {end}",
+        f"Entries use the original EMA4/11/18 signal engine on completed {instrument} five-minute index bars.",
         "EMA9 touch exits use one-minute OHLC against the prior completed five-minute EMA9 with a 3-point buffer.",
         "The buffered EMA9 stop is ratcheted at each surviving five-minute close; square-off is 15:15 IST.",
         f"Option selection: {strike_steps}-step ITM from nearest listed ATM, nearest upcoming expiry.",
@@ -553,8 +623,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-date", default="2025-01-01")
     parser.add_argument("--end-date", default="2026-10-23")
     parser.add_argument("--lots", type=int, default=1)
-    parser.add_argument("--daily-loss-cap", type=float, default=5500.0)
+    parser.add_argument("--daily-loss-cap", type=float, default=3500.0)
     parser.add_argument("--strike-steps", type=int, default=2)
+    parser.add_argument("--instrument", choices=("NIFTY", "SENSEX"), default="NIFTY")
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--no-cache", action="store_true", help="Disable persistent history caching.")
     cache_group.add_argument("--refresh-cache", action="store_true", help="Refresh cached history requests.")
@@ -600,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
             strike_steps=args.strike_steps,
             use_cache=not args.no_cache,
             refresh_cache=args.refresh_cache,
+            instrument=args.instrument,
         )
     except (FyersAPIError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
@@ -612,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         lots=args.lots,
         daily_loss_cap=args.daily_loss_cap,
         strike_steps=args.strike_steps,
+        instrument=args.instrument,
     )
     return 0
 
