@@ -58,8 +58,10 @@ TRADE_COLUMNS = [
     "entry_option_price",
     "exit_option_price",
     "option_pnl",
+    "daily_option_pnl",
+    "daily_option_loss_cap",
 ]
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -93,21 +95,22 @@ class SensexPaperEngine:
     def __init__(
         self,
         *,
-        daily_loss_cap: float,
+        daily_option_loss_cap: float,
         trades_path: Path,
         state_path: Path,
-        ema9_buffer_points: float = 0.0,
+        ema9_buffer_points: float = 3.0,
     ) -> None:
-        if not math.isfinite(daily_loss_cap) or daily_loss_cap <= 0:
-            raise ValueError("daily_loss_cap must be positive and finite.")
+        if not math.isfinite(daily_option_loss_cap) or daily_option_loss_cap <= 0:
+            raise ValueError("daily_option_loss_cap must be positive and finite.")
         if not math.isfinite(ema9_buffer_points) or ema9_buffer_points < 0:
             raise ValueError("ema9_buffer_points must be finite and non-negative.")
-        self.daily_loss_cap = daily_loss_cap
+        self.daily_option_loss_cap = daily_option_loss_cap
         self.ema9_buffer_points = ema9_buffer_points
         self.trades_path = trades_path
         self.state_path = state_path
         self.position: PaperPosition | None = None
         self.daily_realized_points = 0.0
+        self.daily_realized_option_pnl = 0.0
         self.daily_loss_halted = False
         self.trading_day: date | None = None
         self.last_processed_bar: pd.Timestamp | None = None
@@ -123,10 +126,10 @@ class SensexPaperEngine:
                     "SENSEX paper state is from an incompatible runner version. Archive the state and "
                     "ledger only after checking whether a paper position is still open."
                 )
-            saved_cap = float(state["daily_loss_cap"])
-            if saved_cap != self.daily_loss_cap:
+            saved_cap = float(state["daily_option_loss_cap"])
+            if saved_cap != self.daily_option_loss_cap:
                 raise RuntimeError(
-                    "The SENSEX paper cap differs from the saved state. Resume with the original cap "
+                    "The SENSEX paper option-P&L cap differs from the saved state. Resume with the original cap "
                     "or archive the state and trade ledger before starting a new paper run."
                 )
             saved_buffer = float(state["ema9_buffer_points"])
@@ -136,6 +139,7 @@ class SensexPaperEngine:
                     "or archive the state and trade ledger before starting a new paper run."
                 )
             self.daily_realized_points = float(state["daily_realized_points"])
+            self.daily_realized_option_pnl = float(state["daily_realized_option_pnl"])
             self.daily_loss_halted = bool(state["daily_loss_halted"])
             self.trading_day = (
                 date.fromisoformat(state["trading_day"]) if state.get("trading_day") else None
@@ -157,16 +161,17 @@ class SensexPaperEngine:
             raise
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Unable to read SENSEX paper state {self.state_path}.") from exc
-        if not math.isfinite(self.daily_realized_points):
-            raise RuntimeError(f"SENSEX paper state has invalid realized points: {self.state_path}.")
+        if not math.isfinite(self.daily_realized_points) or not math.isfinite(self.daily_realized_option_pnl):
+            raise RuntimeError(f"SENSEX paper state has invalid realized P&L: {self.state_path}.")
 
     def save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         state = {
             "version": STATE_VERSION,
-            "daily_loss_cap": self.daily_loss_cap,
+            "daily_option_loss_cap": self.daily_option_loss_cap,
             "ema9_buffer_points": self.ema9_buffer_points,
             "daily_realized_points": self.daily_realized_points,
+            "daily_realized_option_pnl": self.daily_realized_option_pnl,
             "daily_loss_halted": self.daily_loss_halted,
             "trading_day": self.trading_day.isoformat() if self.trading_day else None,
             "last_processed_bar": self.last_processed_bar.isoformat() if self.last_processed_bar else None,
@@ -224,6 +229,7 @@ class SensexPaperEngine:
         if self.trading_day != today or self.last_processed_bar is None:
             self.trading_day = today
             self.daily_realized_points = 0.0
+            self.daily_realized_option_pnl = 0.0
             self.daily_loss_halted = False
         if not has_open_position:
             self.last_processed_bar = latest_bar_time
@@ -285,23 +291,50 @@ class SensexPaperEngine:
             "entry_option_price": closed_position.entry_option_price,
             "exit_option_price": option_price,
             "option_pnl": option_pnl,
+            "daily_option_pnl": self.daily_realized_option_pnl + option_pnl,
+            "daily_option_loss_cap": self.daily_option_loss_cap,
         }
         self.daily_realized_points += trade["index_points"]
+        self.daily_realized_option_pnl += option_pnl
         self._append_trade(trade)
         self.position = None
-        if self.daily_realized_points <= -self.daily_loss_cap:
+        if self.daily_realized_option_pnl <= -self.daily_option_loss_cap:
             self.daily_loss_halted = True
         self.save_state()
         LOGGER.info(
-            "PAPER EXIT %s %s; option pnl=%+.2f INR; index=%+.2f points; daily index=%+.2f; reason=%s",
+            (
+                "PAPER EXIT %s %s; option pnl=%+.2f INR; daily option=%+.2f INR; "
+                "index=%+.2f points; daily index=%+.2f; reason=%s"
+            ),
             trade["signal"],
             closed_position.contract.symbol,
             option_pnl,
+            self.daily_realized_option_pnl,
             trade["index_points"],
             self.daily_realized_points,
             reason,
         )
         return trade
+
+    def close_if_option_loss_cap_breached(
+        self,
+        at: pd.Timestamp,
+        index_price: float,
+        option_price: float,
+    ) -> dict[str, Any] | None:
+        if self.daily_loss_halted or self.position is None:
+            return None
+        open_option_pnl = (
+            option_price - self.position.entry_option_price
+        ) * self.position.quantity
+        if self.daily_realized_option_pnl + open_option_pnl > -self.daily_option_loss_cap:
+            return None
+        return self.close_position(
+            at,
+            index_price,
+            option_price,
+            "OPTION_DAILY_MAX_LOSS",
+        )
 
     def process_completed_bars(
         self,
@@ -350,6 +383,7 @@ class SensexPaperEngine:
                     raise RuntimeError("Paper position crossed into a new SENSEX trading day.")
                 self.trading_day = trading_day
                 self.daily_realized_points = 0.0
+                self.daily_realized_option_pnl = 0.0
                 self.daily_loss_halted = False
 
             bar_close_time = bar_start + pd.Timedelta(minutes=5)
@@ -372,27 +406,18 @@ class SensexPaperEngine:
 
                         if minute_close_time == bar_close_time:
                             direction = 1.0 if self.position.signal == "ENTER_LONG" else -1.0
-                            close_points = direction * (
-                                float(bar["close"]) - self.position.entry_index
-                            )
                             exit_reason = ""
                             exit_index = float(bar["close"])
-                            if self.daily_realized_points + close_points <= -self.daily_loss_cap:
-                                exit_reason = "DAILY_MAX_LOSS"
-                                self.daily_loss_halted = True
-                            else:
-                                trailing_stop = self.position.trailing_stop
-                                trail_hit = (
-                                    float(bar["close"]) <= trailing_stop
-                                    if direction > 0
-                                    else float(bar["close"]) >= trailing_stop
-                                )
-                                if trail_hit:
-                                    exit_reason = "TRAILING_STOP"
-                                    if self.daily_realized_points + close_points <= -self.daily_loss_cap:
-                                        self.daily_loss_halted = True
-                                elif bar_close_time.time() >= SQUARE_OFF:
-                                    exit_reason = "SQUARE_OFF"
+                            trailing_stop = self.position.trailing_stop
+                            trail_hit = (
+                                float(bar["close"]) <= trailing_stop
+                                if direction > 0
+                                else float(bar["close"]) >= trailing_stop
+                            )
+                            if trail_hit:
+                                exit_reason = "TRAILING_STOP"
+                            elif bar_close_time.time() >= SQUARE_OFF:
+                                exit_reason = "SQUARE_OFF"
 
                             if exit_reason:
                                 closing_position = self.position
@@ -404,7 +429,7 @@ class SensexPaperEngine:
                                     exit_reason,
                                 )
                                 notifier.notify(_format_exit_message(closing_position, trade))
-                                if exit_reason == "DAILY_MAX_LOSS":
+                                if self.daily_loss_halted:
                                     break
                             else:
                                 current_ema9 = float(bar["ema9"])
@@ -444,12 +469,13 @@ class SensexPaperEngine:
                             "EMA9_TOUCH",
                         )
                         notifier.notify(_format_exit_message(closing_position, trade))
+                        if self.daily_loss_halted:
+                            break
 
             if (
                 self.position is None
                 and not position_open_at_bar_start
                 and not self.daily_loss_halted
-                and self.daily_realized_points > -self.daily_loss_cap
                 and ENTRY_START <= bar_close_time.time() < SQUARE_OFF
             ):
                 decision = engine.evaluate_candle(enriched_bars.iloc[: bar_index + 1])
@@ -490,7 +516,12 @@ class SensexPaperEngine:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cap", type=float, help="Daily loss cap in SENSEX points.")
+    parser.add_argument(
+        "--option-daily-loss-cap",
+        type=float,
+        help="Daily realized-plus-open option loss cap in rupees (default: 3500).",
+    )
+    parser.add_argument("--cap", type=float, help=argparse.SUPPRESS)
     parser.add_argument(
         "--ema9-buffer-points",
         type=float,
@@ -533,7 +564,12 @@ def _format_exit_message(position: PaperPosition, trade: dict[str, Any]) -> str:
     contract = position.contract
     direction = "LONG" if position.signal == "ENTER_LONG" else "SHORT"
     symbol = f"SENSEX-{contract.expiry:%b%Y}-{contract.strike:g}-{contract.option_type}"
-    display_reason = "TIME_CUTOFF" if trade["exit_reason"] == "SQUARE_OFF" else trade["exit_reason"]
+    if trade["exit_reason"] == "SQUARE_OFF":
+        display_reason = "TIME_CUTOFF"
+    elif trade["exit_reason"] == "OPTION_DAILY_MAX_LOSS":
+        display_reason = f"OPTION_DAILY_LOSS_CAP · ₹{trade['daily_option_loss_cap']:g}"
+    else:
+        display_reason = trade["exit_reason"]
     option_pnl = trade["option_pnl"]
     pnl_text = f"+₹{option_pnl:.2f}" if option_pnl >= 0 else f"-₹{abs(option_pnl):.2f}"
     return (
@@ -543,6 +579,7 @@ def _format_exit_message(position: PaperPosition, trade: dict[str, Any]) -> str:
         f"  Entry: ₹{trade['entry_option_price']:.2f} → Exit: ₹{trade['exit_option_price']:.2f}\n"
         f"Qty: {position.quantity} (lot size {contract.lot_size})\n"
         f"⚪ P&L: {pnl_text}\n"
+        f"Daily option P&L: ₹{trade['daily_option_pnl']:+.2f}\n"
         f"Index points: {trade['index_points']:+.2f}\n"
         f"[PAPER] {pd.Timestamp(trade['exit_time']).tz_convert(IST):%Y-%m-%d %H:%M:%S} IST"
     )
@@ -593,10 +630,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     load_dotenv(ENV_FILE, override=False)
     _require_paper_mode()
-    args.cap = (
-        args.cap
-        if args.cap is not None
-        else float(os.getenv("SENSEX_PAPER_DAILY_LOSS_CAP", "300"))
+    if args.cap is not None:
+        raise SystemExit(
+            "--cap previously meant SENSEX index points and is no longer supported. "
+            "Use --option-daily-loss-cap for the daily option-P&L cap."
+        )
+    if os.getenv("SENSEX_PAPER_DAILY_LOSS_CAP", "").strip():
+        raise SystemExit(
+            "SENSEX_PAPER_DAILY_LOSS_CAP used index-point units and is no longer supported. "
+            "Remove it and configure SENSEX_PAPER_OPTION_DAILY_LOSS_CAP in rupees."
+        )
+    args.option_daily_loss_cap = (
+        args.option_daily_loss_cap
+        if args.option_daily_loss_cap is not None
+        else float(os.getenv("SENSEX_PAPER_OPTION_DAILY_LOSS_CAP", "3500"))
     )
     args.ema9_buffer_points = (
         args.ema9_buffer_points
@@ -608,8 +655,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.poll_seconds is not None
         else int(os.getenv("SENSEX_PAPER_POLL_SECONDS", "30"))
     )
-    if not math.isfinite(args.cap) or args.cap <= 0:
-        raise SystemExit("--cap must be positive and finite.")
+    if not math.isfinite(args.option_daily_loss_cap) or args.option_daily_loss_cap <= 0:
+        raise SystemExit("--option-daily-loss-cap must be positive and finite.")
     if not math.isfinite(args.ema9_buffer_points) or args.ema9_buffer_points < 0:
         raise SystemExit("--ema9-buffer-points must be finite and non-negative.")
     if args.poll_seconds <= 0 or args.poll_seconds > 120:
@@ -633,15 +680,15 @@ def main(argv: list[str] | None = None) -> int:
     logic = _load_signal_logic()
     strategy_config = logic.EMATrendConfig(exit_ema_period=9)
     engine = SensexPaperEngine(
-        daily_loss_cap=args.cap,
+        daily_option_loss_cap=args.option_daily_loss_cap,
         ema9_buffer_points=args.ema9_buffer_points,
         trades_path=args.trades_file,
         state_path=args.state_file,
     )
     LOGGER.info(
-        "SENSEX EMA9-touch PAPER options runner started; cap=%s index points; EMA9 buffer=%s points; "
+        "SENSEX EMA9-touch PAPER options runner started; cap=₹%s option P&L; EMA9 buffer=%s points; "
         "poll=%ss; no orders will be submitted.",
-        args.cap,
+        args.option_daily_loss_cap,
         args.ema9_buffer_points,
         args.poll_seconds,
     )
@@ -649,7 +696,7 @@ def main(argv: list[str] | None = None) -> int:
         "✅ Strategy started successfully · EMA\n"
         "Mode: PAPER\n"
         f"Underlying: {INDEX_SYMBOL}\n"
-        f"Daily loss cap: {args.cap:g} SENSEX index points\n"
+        f"Daily option P&L loss cap: ₹{args.option_daily_loss_cap:g}\n"
         f"EMA9 stop buffer: {args.ema9_buffer_points:g} SENSEX points\n"
         "Contracts: nearest-expiry ATM; BUY CE for LONG / BUY PE for SHORT\n"
         "Timeframe: completed five-minute candles"
@@ -735,6 +782,15 @@ def main(argv: list[str] | None = None) -> int:
                 option_open_pnl = (
                     option_quote - engine.position.entry_option_price
                 ) * engine.position.quantity
+                closing_position = engine.position
+                trade = engine.close_if_option_loss_cap_breached(
+                    pd.Timestamp.now(tz=IST),
+                    index_quote,
+                    option_quote,
+                )
+                if trade is not None:
+                    option_open_pnl = 0.0
+                    notifier.notify(_format_exit_message(closing_position, trade))
             engine.save_state()
             open_points = 0.0
             if engine.position is not None:
@@ -743,14 +799,16 @@ def main(argv: list[str] | None = None) -> int:
             LOGGER.info(
                 (
                     "SENSEX=%.2f; EMA9=%.2f; realized=%+.2f index pts; "
-                    "open=%+.2f index pts; option open P&L=%+.2f INR; cap=%s; halted=%s"
+                    "open=%+.2f index pts; realized option=%+.2f INR; open option=%+.2f INR; "
+                    "option cap=₹%s; halted=%s"
                 ),
                 index_quote,
                 float(enriched.iloc[-1]["ema9"]),
                 engine.daily_realized_points,
                 open_points,
+                engine.daily_realized_option_pnl,
                 option_open_pnl,
-                args.cap,
+                args.option_daily_loss_cap,
                 engine.daily_loss_halted,
             )
             if market_time >= SQUARE_OFF:

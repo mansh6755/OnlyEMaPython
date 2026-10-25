@@ -98,9 +98,9 @@ def _minutes(*, first_low=999.0, first_open=1000.0):
     )
 
 
-def _engine(tmp_path, cap=300, ema9_buffer_points=0.0):
+def _engine(tmp_path, cap=3500, ema9_buffer_points=0.0):
     return SensexPaperEngine(
-        daily_loss_cap=cap,
+        daily_option_loss_cap=cap,
         ema9_buffer_points=ema9_buffer_points,
         trades_path=tmp_path / "trades.csv",
         state_path=tmp_path / "state.json",
@@ -180,6 +180,9 @@ def test_paper_minute_ohlc_touch_uses_prior_ema_and_option_ltp_for_rupee_pnl(tmp
     assert trade["entry_option_price"] == 177.70
     assert trade["exit_option_price"] == 139.50
     assert trade["option_pnl"] == pytest.approx(-764.0)
+    assert trade["daily_option_pnl"] == pytest.approx(-764.0)
+    assert trade["daily_option_loss_cap"] == 3500.0
+    assert engine.daily_realized_option_pnl == pytest.approx(-764.0)
     assert trade["exit_time"] == "2026-01-01T09:26:00+05:30"
     assert "SELL SENSEX-Jan2026-80000-CE" in notifier.messages[-1]
     assert "-₹764.00" in notifier.messages[-1]
@@ -209,6 +212,35 @@ def test_paper_minute_touch_uses_buffered_prior_ema9(tmp_path):
     assert trade["exit_index"] == 897.0
 
 
+def test_index_points_loss_alone_does_not_trigger_option_rupee_cap(tmp_path):
+    engine = _engine(tmp_path, ema9_buffer_points=3.0)
+    api = _FakeAPI(option_price=177.70)
+    api.quote_prices.extend([177.70, 139.50])
+    notifier = _FakeNotifier()
+    _enter_position(engine, api, notifier, ema9=500.0)
+    minute_bars = _minutes()
+    minute_bars["open"] = [800.0, 750.0, 700.0, 700.0, 700.0]
+    minute_bars["high"] = [805.0] * 5
+    minute_bars["low"] = [795.0, 695.0, 695.0, 695.0, 695.0]
+    minute_bars["close"] = [800.0, 700.0, 700.0, 700.0, 700.0]
+
+    engine.process_completed_bars(
+        _bars(close=1000.0, ema9=500.0),
+        minute_bars,
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 1),
+        now=pd.Timestamp("2026-01-01T09:30:00+05:30").to_pydatetime(),
+        signal_logic=_FakeSignalLogic,
+        strategy_config=object(),
+        api=api,
+        notifier=notifier,
+    )
+
+    assert engine.position is not None
+    assert not engine.daily_loss_halted
+    assert not engine.trades_path.exists()
+
+
 def test_minute_ohlc_gap_through_fills_at_minute_open_and_ignores_incomplete_minute(tmp_path):
     engine = _engine(tmp_path)
     api = _FakeAPI(option_price=177.70)
@@ -235,31 +267,46 @@ def test_minute_ohlc_gap_through_fills_at_minute_open_and_ignores_incomplete_min
     assert trade["exit_time"] == "2026-01-01T09:26:00+05:30"
 
 
-def test_paper_cap_is_triggered_only_at_completed_five_minute_close(tmp_path):
-    engine = _engine(tmp_path)
-    api = _FakeAPI(option_price=200.0)
-    api.quote_prices.extend([177.70, 200.0])
+def test_option_rupee_cap_exits_open_position_and_halts_entries(tmp_path):
+    engine = _engine(tmp_path, cap=700.0)
+    api = _FakeAPI(option_price=177.70)
     notifier = _FakeNotifier()
     _enter_position(engine, api, notifier, ema9=500.0)
+    api.option_price = 139.50
 
-    engine.process_completed_bars(
-        _bars(close=600.0, ema9=500.0),
-        _minutes(),
-        start=date(2026, 1, 1),
-        end=date(2026, 1, 1),
-        now=pd.Timestamp("2026-01-01T09:30:00+05:30").to_pydatetime(),
-        signal_logic=_FakeSignalLogic,
-        strategy_config=object(),
-        api=api,
-        notifier=notifier,
+    trade = engine.close_if_option_loss_cap_breached(
+        pd.Timestamp("2026-01-01T09:27:05+05:30"),
+        990.0,
+        api.option_price,
     )
 
-    trade = pd.read_csv(engine.trades_path).iloc[0]
-    assert trade["exit_reason"] == "DAILY_MAX_LOSS"
-    assert trade["exit_time"] == "2026-01-01T09:30:00+05:30"
-    assert trade["index_points"] == -400.0
-    assert trade["option_pnl"] == pytest.approx(446.0)
+    assert trade is not None
+    assert trade["exit_reason"] == "OPTION_DAILY_MAX_LOSS"
+    assert trade["exit_time"] == "2026-01-01T09:27:05+05:30"
+    assert trade["index_points"] == -10.0
+    assert trade["option_pnl"] == pytest.approx(-764.0)
+    assert engine.daily_realized_option_pnl == pytest.approx(-764.0)
     assert engine.daily_loss_halted
+    assert engine.position is None
+
+
+def test_closed_trade_option_loss_reaching_cap_blocks_new_entries(tmp_path):
+    engine = _engine(tmp_path, cap=700.0)
+    api = _FakeAPI(option_price=177.70)
+    notifier = _FakeNotifier()
+    _enter_position(engine, api, notifier)
+    api.option_price = 139.50
+
+    trade = engine.close_position(
+        pd.Timestamp("2026-01-01T09:27:00+05:30"),
+        990.0,
+        139.50,
+        "EMA9_TOUCH",
+    )
+
+    assert trade["option_pnl"] == pytest.approx(-764.0)
+    assert engine.daily_loss_halted
+    assert engine.daily_realized_option_pnl == pytest.approx(-764.0)
 
 
 def test_paper_state_restores_contract_and_rejects_changed_cap(tmp_path):
@@ -269,7 +316,8 @@ def test_paper_state_restores_contract_and_rejects_changed_cap(tmp_path):
     _enter_position(engine, api, notifier)
 
     restored = SensexPaperEngine(
-        daily_loss_cap=250,
+        daily_option_loss_cap=250,
+        ema9_buffer_points=0.0,
         trades_path=tmp_path / "trades.csv",
         state_path=tmp_path / "state.json",
     )
@@ -278,7 +326,8 @@ def test_paper_state_restores_contract_and_rejects_changed_cap(tmp_path):
 
     with pytest.raises(RuntimeError, match="cap differs"):
         SensexPaperEngine(
-            daily_loss_cap=300,
+            daily_option_loss_cap=300,
+            ema9_buffer_points=0.0,
             trades_path=tmp_path / "trades.csv",
             state_path=tmp_path / "state.json",
         )
@@ -290,7 +339,7 @@ def test_paper_state_rejects_changed_ema9_buffer(tmp_path):
 
     with pytest.raises(RuntimeError, match="EMA9 buffer differs"):
         SensexPaperEngine(
-            daily_loss_cap=300,
+            daily_option_loss_cap=3500,
             ema9_buffer_points=6.0,
             trades_path=tmp_path / "trades.csv",
             state_path=tmp_path / "state.json",
@@ -302,7 +351,9 @@ def test_state_file_contains_no_option_order_execution_fields(tmp_path):
     engine.save_state()
 
     state = json.loads(engine.state_path.read_text(encoding="utf-8"))
-    assert state["version"] == 3
+    assert state["version"] == 4
+    assert state["daily_option_loss_cap"] == 3500
+    assert state["daily_realized_option_pnl"] == 0.0
     assert "orders" not in state
 
 
@@ -417,6 +468,8 @@ def test_exit_message_includes_contract_option_pnl_and_index_points():
         "entry_option_price": 100.0,
         "exit_option_price": 125.0,
         "option_pnl": 500.0,
+        "daily_option_pnl": 500.0,
+        "daily_option_loss_cap": 3500.0,
         "index_points": 25.0,
         "exit_time": "2026-01-01T10:00:00+05:30",
     }

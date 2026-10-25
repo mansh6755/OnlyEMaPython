@@ -51,7 +51,9 @@ five-minute candle close when the cap is breached, and blocks entries for the
 rest of that day. Because exits are evaluated only at candle close, a gap or
 fast move can make the loss exceed the cap. Index history is
 requested one calendar day at a time to avoid Fyers range-request failures.
-SENSEX index testing is index-only; the options replay remains NIFTY-only.
+SENSEX index testing remains the source of all entries, exits, and cap decisions;
+option prices are available as an optional reporting overlay. The separate
+options-driven replay remains NIFTY-only.
 An index-only trailing stop can be selected with `--trailing-stop`:
 `swing_2bar`, `atr_2x`, `breakeven_1r_ema9`, `breakeven_1r_ema11`, or
 `combined`. The default is
@@ -84,9 +86,9 @@ expose the platform's `PORT` to the callback server. The notification chat is
 configured separately using `TELEGRAM_CHAT_ID`.
 
 Configure the server service's start command as
-`python Dependencies/fyers_sensex_paper_runner.py` (optionally pass `--cap 300`
-and `--poll-seconds 30`). Do not start it on a local workstation when the
-intended deployment is the production server.
+`python Dependencies/fyers_sensex_paper_runner.py` (optionally pass
+`--option-daily-loss-cap 3500` and `--poll-seconds 30`). Do not start it on a
+local workstation when the intended deployment is the production server.
 
 Signals use completed five-minute candles. LONG buys the nearest-expiry ATM CE;
 SHORT buys the nearest-expiry ATM PE. The selected contract's official lot size
@@ -99,13 +101,18 @@ through the buffered level, use its open, otherwise use that level. The
 five-minute trailing stop starts at the similarly buffered entry-bar EMA9 and
 ratchets in the trade's favorable direction. The buffer defaults to 3 points
 and can be changed with `SENSEX_PAPER_EMA9_BUFFER_POINTS` or `--ema9-buffer-points`.
-Trailing stop and the 300-point daily loss cap are checked at completed
-five-minute closes, in the same order as the replay. These triggers use the
-SENSEX index, not option premium. Option rupee P&L uses option LTP snapshots, so
-option fills remain estimates and the historical index-only replay does not
-verify them. The index-point cap counts realized plus open directional index
-points at completed five-minute closes; it is not a rupee loss limit, and gaps
-can exceed it. Telegram alerts use the existing
+The daily loss cap is ₹3,500 of aggregate option P&L: realized option P&L plus
+the open position's current option-LTP mark-to-market. It is evaluated each
+time the runner polls quotes (30 seconds by default, configurable with
+`--poll-seconds` or `SENSEX_PAPER_POLL_SECONDS`). When reached, the runner
+closes the paper position at the current option LTP and halts entries for the
+rest of the day. Rapid moves can exceed the cap between polls. EMA9 exits and
+the trailing stop remain based on completed SENSEX candles. Option P&L remains
+an estimate from LTP snapshots and excludes fees, spread, and slippage.
+Configure the cap with `--option-daily-loss-cap` or
+`SENSEX_PAPER_OPTION_DAILY_LOSS_CAP`; the default is 3500 rupees. Old `--cap`
+and `SENSEX_PAPER_DAILY_LOSS_CAP` index-point settings are rejected to avoid
+silently misinterpreting their units. Telegram alerts use the existing
 `TELEGRAM_ENABLED`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` configuration.
 
 To test stop spacing in the historical index replay, run
@@ -114,6 +121,58 @@ The buffer is applied below EMA9 for LONG stops and above EMA9 for SHORT stops,
 including the initial stop, each five-minute trailing update, and one-minute
 touch exits. The replay defaults to 3 points to match the paper runner; pass
 `--ema9-buffer-points 0` to reproduce the original unbuffered replay.
+The replay checks the daily cap at each completed one-minute close, before
+checking that minute's EMA9-touch condition; on a same-minute collision, the
+cap close is used.
+
+To add historical nearest-expiry ATM option candle marks to each SENSEX replay
+trade, pass `--option-prices`. Option marks always use Fyers Prime 5-second
+candles, including for expired contracts, with no fallback to one-minute
+history. For example:
+`python "Dependencies/fyers_sensex_touch_replay.py" --start-date 2026-10-01 --end-date 2026-10-23 --caps 300 --option-prices`.
+
+The resulting trades CSV includes the selected contract, expiry, strike,
+resolution, entry/exit option candle close and completion timestamps, and
+estimated one-lot gross premium P&L. The quote is the latest fully completed
+five-second option candle available at or before the index action timestamp,
+so no future option candle is used. Missing candles are labeled in
+`option_price_status` and left blank rather than replaced with lower-resolution
+prices. With `--option-prices` alone, this overlay does not change any
+index-based signal, fill, cap, or exit. Premium P&L is indicative only, excludes
+fees/spread/slippage, and uses the current derivatives-master lot size as a
+proxy for archived contracts. Option history requests are cached with the rest
+of the Fyers history.
+
+To use a rupee-denominated option premium cap in the historical replay, pass
+`--option-daily-loss-cap 3500`. The replay uses 5-second history, aggregates
+realized P&L and the open position's premium mark-to-market, and checks the
+total at every completed 5-second candle. At or below -₹3,500 it exits at that
+candle close and blocks new entries for the rest of the day.
+`--option-daily-loss-cap` is mutually exclusive with `--caps`; the existing
+index-based replay behavior remains the default when no option cap is specified.
+
+Option-cap trades use the latest completed one-minute SENSEX close available at
+the option-cap timestamp to estimate index points for reporting; this is an
+index mark, not a synchronized 5-second SENSEX fill. The option-cap decision
+and estimated premium P&L use only completed 5-second option candles. This
+historical option P&L remains gross and uses the current derivatives-master lot
+size as a proxy for archived lot sizes.
+
+To compare contract selection while holding the index signals and exit rules
+constant, run:
+`python "Dependencies/fyers_sensex_touch_replay.py" --start-date 2025-01-01 --end-date 2026-10-23 --option-daily-loss-cap 3500 --option-strike-steps 2 1 0 -1 -2`.
+Zero selects nearest ATM; positive values select that many listed strike steps
+ITM and negative values that many steps OTM, with CE and PE directions handled
+automatically. Each selection gets an independent 5-second option-P&L cap
+replay. The command writes individual trades/summary files and a combined
+strike-comparison CSV with gross P&L, trade-equity drawdown, daily P&L, win
+rate, profit factor, cap days, and price-mark coverage. As with other replay
+results, these are estimates before fees, spread, slippage, and market impact.
+Because Fyers' expired-symbol endpoint can return a sparse strike list, expired
+ATM and offset strikes are reconstructed from the expiry symbol prefix using
+the minimum current SENSEX master strike spacing; the replay summary records
+that spacing. Historical changes to the strike interval would affect this
+reconstruction.
 
 For a server deployment, set `LIVE_TRADING_ENABLED=false`,
 `TELEGRAM_ENABLED=true`, and persist the token, ledger, and state on a durable
@@ -123,10 +182,13 @@ For example, with a volume mounted at `/data`, set
 `FYERS_TOKEN_FILE=/data/fyers_access_token`,
 `SENSEX_PAPER_TRADES_FILE=/data/fyers_sensex_paper_trades.csv`, and
 `SENSEX_PAPER_STATE_FILE=/data/fyers_sensex_paper_state.json`. The default cap
-and polling interval are configurable through `SENSEX_PAPER_DAILY_LOSS_CAP`
-(300) and `SENSEX_PAPER_POLL_SECONDS` (30), or CLI flags. Keep the same cap
-when resuming a saved state. The runner rejects incompatible state versions and
-ledger schemas rather than silently resetting them. Use `--help` to see options.
+and polling interval are configurable through
+`SENSEX_PAPER_OPTION_DAILY_LOSS_CAP` (3500) and
+`SENSEX_PAPER_POLL_SECONDS` (30), or CLI flags. Keep the same cap when resuming
+a saved state. Changing from the old index-point cap requires archiving the
+incompatible saved state and ledger after confirming no paper position is open.
+The runner rejects incompatible state versions and ledger schemas rather than
+silently resetting them. Use `--help` to see options.
 
 The remaining sections describe retained shared utilities and legacy broker
 integrations. Their `LIVE_BROKER` guidance does not apply to the active EMA runner.
