@@ -3,7 +3,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from Dependencies.fyers_api import FyersAPI, FyersAPIError, build_auth_url, parse_nse_fo_master, quote_ltp
+from Dependencies.fyers_api import (
+    BSE_FO_MASTER_URL,
+    FyersAPI,
+    FyersAPIError,
+    build_auth_url,
+    parse_fyers_fo_master,
+    parse_nse_fo_master,
+    quote_ltp,
+)
 
 
 class _Response:
@@ -74,6 +82,47 @@ def test_parse_nse_fo_master_reads_exact_symbol_and_lot_size_columns():
             "lot_size": 65,
         }
     ]
+
+
+def test_generic_fo_master_parser_reads_bse_contracts():
+    row = (
+        "101126101335028,SENSEX 13 Oct 26 84000 CE,14,20,0.05,,0915-1540:,"
+        "2026-10-08,1791886200,BSE:SENSEX26O1384000CE,10,11,35028,SENSEX,26000,"
+        "84000.0,CE,10100000026000,None,0,0.0"
+    )
+
+    assert parse_fyers_fo_master(row)[0]["symbol"] == "BSE:SENSEX26O1384000CE"
+    assert parse_nse_fo_master(row) == parse_fyers_fo_master(row)
+
+
+def test_option_master_selects_and_caches_exchange_master():
+    class MasterResponse:
+        text = (
+            "101126101335028,SENSEX 13 Oct 26 84000 CE,14,20,0.05,,0915-1540:,"
+            "2026-10-08,1791886200,BSE:SENSEX26O1384000CE,10,11,35028,SENSEX,26000,"
+            "84000.0,CE,10100000026000,None,0,0.0"
+        )
+
+        def raise_for_status(self):
+            return None
+
+    class MasterSession(_Session):
+        def __init__(self):
+            super().__init__(_Response({}))
+            self.urls = []
+
+        def get(self, url, **_kwargs):
+            self.urls.append(url)
+            return MasterResponse()
+
+    session = MasterSession()
+    api = FyersAPI("app-100", "test-token", session=session)
+
+    first = api.option_master("BSE")
+    second = api.option_master("BSE")
+
+    assert first is second
+    assert session.urls == [BSE_FO_MASTER_URL]
 
 
 def test_fyers_history_converts_epoch_candles_to_ist_ohlcv():

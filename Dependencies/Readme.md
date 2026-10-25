@@ -13,6 +13,53 @@ credentials below and explicitly set `LIVE_TRADING_ENABLED=true` in the ignored
 an open order, position, or indeterminate account response. A partial or ambiguous
 order result stops the runner for manual reconciliation.
 
+### Separate NIFTY/SENSEX EMA9 forward test
+
+The dedicated forward-test runner is separate from the EMA11 runner above and
+does not change its behavior. Start one instrument at a time with:
+
+```sh
+python -m Dependencies.fyers_ema9_forward_launcher
+```
+
+Set `EMA9_INSTRUMENT=NIFTY` or `EMA9_INSTRUMENT=SENSEX`; the launcher refuses to
+start if it is unset or invalid. `EMA9_EXECUTION_MODE` defaults to `PAPER`. The
+runner uses the original completed-5-minute EMA4/11/18 entry signals, a 3-point
+EMA9 touch/trailing exit checked from completed 1-minute candles, one option lot,
+2 listed strikes ITM, the nearest listed expiry that has not passed, and a ₹3,500
+daily realized-plus-open option loss cap. NIFTY and SENSEX use the same upcoming
+expiry rule as their EMA9 replays. The two instruments have separate state and CSV
+ledger files under `Forward Test Outputs/` by default.
+
+Telegram alerts are enabled for this runner: it sends startup, entry, exit,
+hourly health during the weekday market-data session, once-per-day end-of-day
+option-P&L, and error notifications. The hourly health alert reports the runner
+mode, market-data status and last success, open position, realized P&L, and daily
+loss-cap status. It uses
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, falling back to
+`FYERS_AUTH_TELEGRAM_CHAT_ID` when no separate trade-alert destination is set.
+Error details are redacted and repeated errors are rate-limited.
+
+To enable live orders, set `EMA9_EXECUTION_MODE=LIVE`; leaving it unset or set to
+`PAPER` keeps this runner paper-only. This is the sole execution-mode switch for
+the EMA9 forward test and does not change the legacy EMA11 runner or other
+strategies. Live startup requires a determinate, flat account unless the saved
+runner position exactly matches the one broker position. Review paper behavior
+and order sizing before setting LIVE.
+An open position saved from a prior trading session blocks live restart for manual
+reconciliation; an unpriceable/stale option quote while live also triggers a
+market exit attempt. If Fyers confirms a fill but omits its average price, the
+runner logs and records the pre-order quote as an estimate.
+
+Forward execution follows the backtest's signal, stop, expiry, strike, and cap
+rules, but cannot reproduce historical fills exactly: paper entries/exits use
+fresh Fyers LTP quotes polled at `EMA9_POLL_SECONDS` (default 5 seconds), while
+the replay marks options at completed 5-second candle closes. Live orders use
+confirmed broker fills; slippage, polling delay, and option liquidity can change
+results. Missing or stale quotes stop a paper action rather than fabricating a
+price. In live mode a stale mark while holding a position triggers a market-exit
+attempt instead of leaving the position unattended.
+
 Set up the token with `python algo.py setup-token`. Historical Dhan extractors and
 broker diagnostics remain separate utilities; they are not used by this EMA runner.
 While the service is running, its private Telegram auth chat receives a fresh Fyers

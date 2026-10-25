@@ -22,7 +22,9 @@ from Dependencies.fyers_api import FyersAPI, FyersAPIError  # noqa: E402
 from Dependencies.fyers_options import (  # noqa: E402
     FyersOptionContract,
     select_atm_option,
+    select_next_week_expiry,
 )
+from Dependencies.fyers_history_cache import FyersHistoryCache  # noqa: E402
 
 ENV_FILE = ROOT_DIR / "Dependencies" / ".env"
 OUTPUT_DIR = ROOT_DIR / "Backtest Outputs"
@@ -103,13 +105,6 @@ def _archived_option_rows(symbols: list[str], expiry: date, lot_size: int) -> li
     return rows
 
 
-def _second_expiry_on_or_after(expiries: list[date], trade_date: date) -> date:
-    upcoming = sorted({expiry for expiry in expiries if expiry >= trade_date})
-    if len(upcoming) < 2:
-        raise ValueError(f"Fyers returned fewer than two expiries on or after {trade_date}.")
-    return upcoming[1]
-
-
 def _date_chunks(start: date, end: date, *, chunk_days: int = 90) -> list[tuple[date, date]]:
     if chunk_days <= 0:
         raise ValueError("chunk_days must be positive")
@@ -122,11 +117,25 @@ def _date_chunks(start: date, end: date, *, chunk_days: int = 90) -> list[tuple[
     return chunks
 
 
-def _fetch_index_history(api: FyersAPI, start: date, end: date) -> pd.DataFrame:
-    frames = [
-        api.history(UNDERLYING_SYMBOL, resolution="1", start=chunk_start, end=chunk_end)
-        for chunk_start, chunk_end in _date_chunks(start, end)
-    ]
+def _fetch_index_history(
+    api: FyersAPI,
+    start: date,
+    end: date,
+    history_cache: FyersHistoryCache | None = None,
+) -> pd.DataFrame:
+    frames = []
+    for chunk_start, chunk_end in _date_chunks(start, end):
+        if history_cache is None:
+            frame = api.history(UNDERLYING_SYMBOL, resolution="1", start=chunk_start, end=chunk_end)
+        else:
+            frame = history_cache.history(
+                api,
+                UNDERLYING_SYMBOL,
+                resolution="1",
+                start=chunk_start,
+                end=chunk_end,
+            )
+        frames.append(frame)
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -145,6 +154,46 @@ def _expired_data_query_end(end: date, today: date) -> date:
     return min(end + timedelta(days=21), today - timedelta(days=1))
 
 
+def _select_option_contract(
+    rows: list[dict[str, Any]],
+    *,
+    action: str,
+    spot: float,
+    expiry: date,
+    option_strike_steps: int,
+) -> FyersOptionContract:
+    atm = select_atm_option(rows, action=action, spot=spot, expiry=expiry)
+    if option_strike_steps == 0:
+        return atm
+    strike_direction = -1 if atm.option_type == "CE" else 1
+    strikes = sorted(
+        {
+            float(row["strike_price"])
+            for row in rows
+            if str(row.get("option_type", "")).strip().upper() == atm.option_type
+            and row.get("strike_price") is not None
+        }
+    )
+    atm_index = strikes.index(atm.strike)
+    target_index = atm_index + strike_direction * option_strike_steps
+    if target_index < 0 or target_index >= len(strikes):
+        raise ValueError(
+            f"No {option_strike_steps}-step ITM {atm.option_type} contract is listed for {expiry}."
+        )
+    target_strike = strikes[target_index]
+    return select_atm_option(
+        [
+            row
+            for row in rows
+            if str(row.get("option_type", "")).strip().upper() == atm.option_type
+            and float(row["strike_price"]) == target_strike
+        ],
+        action=action,
+        spot=spot,
+        expiry=expiry,
+    )
+
+
 def _resolve_contract(
     api: FyersAPI,
     *,
@@ -155,8 +204,9 @@ def _resolve_contract(
     expiries: list[date],
     archived_symbols: dict[date, list[str]],
     fallback_lot_size: int,
+    option_strike_steps: int = 0,
 ) -> FyersOptionContract:
-    expiry = _second_expiry_on_or_after(expiries, trade_date)
+    expiry = select_next_week_expiry(expiries, today=trade_date)
     if expiry < date.today():
         if expiry not in archived_symbols:
             archived_symbols[expiry] = api.expired_option_symbols(UNDERLYING_SYMBOL, expiry)
@@ -172,7 +222,13 @@ def _resolve_contract(
                 continue
             if row_expiry == expiry:
                 rows.append({**row, "expiry": expiry})
-    return select_atm_option(rows, action=action, spot=spot, expiry=expiry)
+    return _select_option_contract(
+        rows,
+        action=action,
+        spot=spot,
+        expiry=expiry,
+        option_strike_steps=option_strike_steps,
+    )
 
 
 def _first_fill(bars: pd.DataFrame, timestamp: pd.Timestamp) -> tuple[int, pd.Series] | None:
@@ -240,15 +296,19 @@ def replay_index_signals(
     trade_start: date | None = None,
     trade_end: date | None = None,
     option_resolution: str = "5S",
+    option_strike_steps: int = 0,
+    history_cache: FyersHistoryCache | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     if option_resolution not in OPTION_RESOLUTION_SECONDS:
         raise ValueError(f"Unsupported option resolution: {option_resolution}")
+    if option_strike_steps < 0:
+        raise ValueError("option_strike_steps must be non-negative.")
     option_bar_seconds = OPTION_RESOLUTION_SECONDS[option_resolution]
     enriched = signal_logic.build_ema_trend_with_indicators(index_bars, strategy_config)
     engine = signal_logic.EMATrendSignalEngine(strategy_config)
     contracts = [row for row in active_rows if row.get("underlying") == "NIFTY" and row.get("option_type") == "CE"]
     lot_size = int(contracts[0]["lot_size"]) if contracts else 65
-    history_cache: dict[tuple[str, date], pd.DataFrame] = {}
+    option_day_cache: dict[tuple[str, date], pd.DataFrame] = {}
     trades: list[dict[str, Any]] = []
     counters = {"signals": 0, "entries": 0, "exits": 0, "missing_option_data": 0, "daily_loss_halts": 0}
     position: _OpenTrade | None = None
@@ -257,15 +317,25 @@ def replay_index_signals(
 
     def option_day(contract: FyersOptionContract, day: date) -> pd.DataFrame:
         key = (contract.symbol, day)
-        if key not in history_cache:
-            history_cache[key] = api.history(
-                contract.symbol,
-                resolution=option_resolution,
-                start=day,
-                end=day,
-                expired=contract.expiry < date.today(),
-            )
-        result = history_cache[key].copy()
+        if key not in option_day_cache:
+            if history_cache is None:
+                option_day_cache[key] = api.history(
+                    contract.symbol,
+                    resolution=option_resolution,
+                    start=day,
+                    end=day,
+                    expired=contract.expiry < date.today(),
+                )
+            else:
+                option_day_cache[key] = history_cache.history(
+                    api,
+                    contract.symbol,
+                    resolution=option_resolution,
+                    start=day,
+                    end=day,
+                    expired=contract.expiry < date.today(),
+                )
+        result = option_day_cache[key].copy()
         if not result.empty:
             result = result.sort_values("timestamp").reset_index(drop=True)
         return result
@@ -371,6 +441,7 @@ def replay_index_signals(
                 expiries=expiries,
                 archived_symbols=archived_symbols,
                 fallback_lot_size=lot_size,
+                option_strike_steps=option_strike_steps,
             )
             option_bars = option_day(contract, day)
         except (FyersAPIError, ValueError) as exc:
@@ -413,8 +484,16 @@ def run_backtest(
     lots: int = 1,
     max_daily_loss: float = 5500.0,
     option_resolution: str = "5S",
+    option_strike_steps: int = 0,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    index_minutes = _fetch_index_history(api, start - timedelta(days=7), end)
+    history_cache = FyersHistoryCache(
+        OUTPUT_DIR / ".fyers_cache",
+        enabled=use_cache,
+        refresh=refresh_cache,
+    )
+    index_minutes = _fetch_index_history(api, start - timedelta(days=7), end, history_cache)
     index_bars = _completed_five_minute_bars(index_minutes)
     if index_bars.empty:
         raise RuntimeError("Fyers returned no complete NIFTY five-minute index candles for the requested period.")
@@ -442,12 +521,16 @@ def run_backtest(
         trade_start=start,
         trade_end=end,
         option_resolution=option_resolution,
+        option_strike_steps=option_strike_steps,
+        history_cache=history_cache,
     )
     if counters["missing_option_data"]:
         raise RuntimeError(
             "Backtest incomplete: Fyers option candles/contracts were missing for "
             f"{counters['missing_option_data']} signal/exit events; no report was written."
         )
+    counters["history_cache_hits"] = history_cache.hits
+    counters["history_cache_misses"] = history_cache.misses
     return pd.DataFrame(trades), counters
 
 
@@ -457,9 +540,15 @@ def _write_report(
     start: date,
     end: date,
     option_resolution: str,
+    option_strike_steps: int = 0,
+    max_daily_loss: float = 5500.0,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"nifty_ema_fyers_options_{start:%Y%m%d}_{end:%Y%m%d}"
+    strike_suffix = f"_{option_strike_steps}stepITM" if option_strike_steps else ""
+    stem = (
+        f"nifty_ema_fyers_options_{start:%Y%m%d}_{end:%Y%m%d}"
+        f"{strike_suffix}_cap{max_daily_loss:g}"
+    )
     trades_path = OUTPUT_DIR / f"{stem}_trades.csv"
     summary_path = OUTPUT_DIR / f"{stem}_summary.txt"
     trades.to_csv(trades_path, index=False)
@@ -476,7 +565,12 @@ def _write_report(
         "Signals use NIFTY index 5-minute bars; option fills use the first option candle "
         "open after the completed signal bar.",
         f"Option candle resolution: {option_resolution}",
-        "Expiry policy: second Fyers-listed expiry on or after each signal date.",
+        (
+            f"Strike policy: {option_strike_steps}-step ITM from nearest listed ATM."
+            if option_strike_steps
+            else "Strike policy: ATM."
+        ),
+        "Expiry policy: earliest Fyers-listed expiry in the next ISO calendar week, matching the live runner.",
         "Expired-contract API returns symbols without historical lot size; quantity uses current Fyers NIFTY lot size.",
         "P&L is gross; brokerage, taxes, bid-ask spread, and slippage are not included.",
         f"Signals: {counters['signals']}",
@@ -485,6 +579,7 @@ def _write_report(
         f"Trades completed: {len(trades)}",
         f"Missing option-data events: {counters['missing_option_data']}",
         f"Daily max-loss halts: {counters['daily_loss_halts']}",
+        f"History cache hits/misses: {counters.get('history_cache_hits', 0)}/{counters.get('history_cache_misses', 0)}",
         f"Win rate: {(len(winners) / len(pnl) * 100.0) if len(pnl) else 0.0:.2f}%",
         f"Gross option P&L: {gross:.2f}",
         f"Profit factor: {profit_factor:.4f}",
@@ -505,6 +600,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lots", type=int, default=1)
     parser.add_argument("--max-daily-loss", type=float, default=5500.0)
     parser.add_argument(
+        "--option-strike-steps",
+        type=int,
+        default=0,
+        help="Listed strike steps ITM from nearest ATM (default: 0/ATM).",
+    )
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument("--no-cache", action="store_true", help="Disable persistent history caching.")
+    cache_group.add_argument("--refresh-cache", action="store_true", help="Refresh cached history requests.")
+    parser.add_argument(
         "--option-resolution",
         choices=("auto", "5S", "1"),
         default="auto",
@@ -513,8 +617,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
-    if start > end or args.lots <= 0 or args.max_daily_loss <= 0:
-        parser.error("date range must be valid and lots/loss limit must be positive")
+    if start > end or args.lots <= 0 or args.max_daily_loss <= 0 or args.option_strike_steps < 0:
+        parser.error("date range must be valid, lots/loss limit positive, and strike steps non-negative")
     option_resolution = args.option_resolution
     if option_resolution == "auto":
         option_resolution = "5S" if start >= date.today() - timedelta(days=35) else "1"
@@ -552,10 +656,21 @@ def main(argv: list[str] | None = None) -> int:
             lots=args.lots,
             max_daily_loss=args.max_daily_loss,
             option_resolution=option_resolution,
+            option_strike_steps=args.option_strike_steps,
+            use_cache=not args.no_cache,
+            refresh_cache=args.refresh_cache,
         )
     except (FyersAPIError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
-    _write_report(trades, counters, start, end, option_resolution)
+    _write_report(
+        trades,
+        counters,
+        start,
+        end,
+        option_resolution,
+        args.option_strike_steps,
+        args.max_daily_loss,
+    )
     return 0
 
 

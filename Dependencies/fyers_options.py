@@ -68,6 +68,26 @@ def select_next_week_expiry(expiries: Iterable[Any], *, today: date) -> date:
     return min(candidates)
 
 
+def select_nearest_expiry(expiries: Iterable[Any], *, today: date) -> date:
+    """Select the earliest listed expiry that has not passed."""
+    candidates: set[date] = set()
+    for item in expiries:
+        value = item
+        if isinstance(item, dict):
+            value = item.get("date") or item.get("expiry")
+        if value is None:
+            continue
+        try:
+            expiry = _parse_expiry(value)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if expiry >= today:
+            candidates.add(expiry)
+    if not candidates:
+        raise ValueError(f"Fyers returned no unexpired option expiry on or after {today}.")
+    return min(candidates)
+
+
 def select_atm_option(
     options: Iterable[dict[str, Any]],
     *,

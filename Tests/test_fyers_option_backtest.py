@@ -9,6 +9,7 @@ from Dependencies.fyers_option_backtest import (
     _fetch_index_history,
     _first_fill,
     _resolve_contract,
+    _select_option_contract,
     replay_index_signals,
 )
 from Dependencies.fyers_options import FyersOptionContract
@@ -133,7 +134,7 @@ def test_may_monthly_archived_symbol_uses_month_name_prefix():
     assert {row["strike_price"] for row in rows} == {17100.0}
 
 
-def test_expiry_mapping_uses_second_listed_expiry_after_each_entry_date():
+def test_expiry_mapping_matches_next_iso_week_runner_policy():
     archived = _archived_option_rows(
         ["NSE:NIFTY26O0622500CE"], date(2026, 10, 6), 65
     )
@@ -147,7 +148,10 @@ def test_expiry_mapping_uses_second_listed_expiry_after_each_entry_date():
             "lot_size": 65,
         }
     ]
-    archived_symbols = {date(2026, 10, 6): [row["symbol"] for row in archived]}
+    archived_symbols = {
+        date(2026, 10, 6): [row["symbol"] for row in archived],
+        date(2026, 10, 13): ["NSE:NIFTY26O1322500PE"],
+    }
 
     oct_first = _resolve_contract(
         None,
@@ -180,8 +184,42 @@ def test_expiry_mapping_uses_second_listed_expiry_after_each_entry_date():
         fallback_lot_size=65,
     )
 
-    assert oct_first == FyersOptionContract("NSE:NIFTY26O1322500CE", date(2026, 10, 13), "CE", 22500, 65)
+    assert oct_first == FyersOptionContract("NSE:NIFTY26O0622500CE", date(2026, 10, 6), "CE", 22500, 65)
     assert oct_fifth == FyersOptionContract("NSE:NIFTY26O1322500PE", date(2026, 10, 13), "PE", 22500, 65)
+
+
+def test_option_strike_steps_select_two_listed_steps_itm_from_atm():
+    expiry = date(2026, 10, 13)
+    rows = [
+        {
+            "symbol": f"NSE:NIFTY26O1322{strike}{option_type}",
+            "option_type": option_type,
+            "strike_price": strike,
+            "lot_size": 65,
+        }
+        for strike in (22400, 22450, 22500, 22550, 22600)
+        for option_type in ("CE", "PE")
+    ]
+
+    call = _select_option_contract(
+        rows,
+        action="ENTER_LONG",
+        spot=22510,
+        expiry=expiry,
+        option_strike_steps=2,
+    )
+    put = _select_option_contract(
+        rows,
+        action="ENTER_SHORT",
+        spot=22510,
+        expiry=expiry,
+        option_strike_steps=2,
+    )
+
+    assert call.strike == 22400
+    assert call.option_type == "CE"
+    assert put.strike == 22600
+    assert put.option_type == "PE"
 
 
 def test_first_fill_uses_option_candle_at_or_after_signal_time():
@@ -257,7 +295,10 @@ def test_replay_uses_index_signals_and_five_second_option_fill_prices():
         api=api,
         active_rows=active_rows,
         expiries=[date(2026, 10, 6), date(2026, 10, 13), date(2026, 10, 19)],
-        archived_symbols={date(2026, 10, 6): ["NSE:NIFTY26O0622500CE"]},
+        archived_symbols={
+            date(2026, 10, 6): ["NSE:NIFTY26O0622500CE"],
+            date(2026, 10, 13): ["NSE:NIFTY26O1322500CE"],
+        },
         lots=1,
         max_daily_loss=5500,
     )
@@ -324,7 +365,10 @@ def test_replay_requests_one_minute_option_bars_when_selected():
         api=api,
         active_rows=active_rows,
         expiries=[date(2026, 10, 6), date(2026, 10, 13), date(2026, 10, 19)],
-        archived_symbols={date(2026, 10, 6): ["NSE:NIFTY26O0622500CE"]},
+        archived_symbols={
+            date(2026, 10, 6): ["NSE:NIFTY26O0622500CE"],
+            date(2026, 10, 13): ["NSE:NIFTY26O1322500CE"],
+        },
         lots=1,
         max_daily_loss=5500,
         option_resolution="1",
