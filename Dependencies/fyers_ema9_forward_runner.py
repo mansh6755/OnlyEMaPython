@@ -84,6 +84,10 @@ TRADE_COLUMNS = [
 ]
 
 
+class FyersQuoteError(FyersAPIError):
+    """A Fyers quote request failed or returned unusable option quote data."""
+
+
 @dataclass(frozen=True, slots=True)
 class InstrumentConfig:
     name: str
@@ -384,35 +388,98 @@ def _create_telegram_notifier(environment: dict[str, str]) -> TelegramNotifier:
 
 
 def _quote_ltp(api: FyersAPI, symbol: str, *, now: datetime) -> float:
-    response = api.quotes([symbol])
+    try:
+        response = api.quotes([symbol])
+    except FyersAPIError as exc:
+        LOGGER.warning(
+            "EMA9 option quote request failed symbol=%s error_type=%s error=%s",
+            symbol,
+            type(exc).__name__,
+            exc,
+        )
+        raise FyersQuoteError(
+            f"Fyers option quote request failed for {symbol}: {exc}"
+        ) from exc
     entries = response.get("d")
     if not isinstance(entries, list):
-        raise FyersAPIError("Fyers quote response did not contain quote data.")
+        LOGGER.warning(
+            "EMA9 option quote rejected symbol=%s reason=quote_data_missing "
+            "response_status=%r response_keys=%s",
+            symbol,
+            response.get("s"),
+            sorted(str(key) for key in response),
+        )
+        raise FyersQuoteError(
+            f"Fyers quote response did not contain quote data for {symbol}."
+        )
+    diagnostics: list[str] = []
+    returned_symbols = [
+        str(entry.get("n", "")).strip()
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
     for entry in entries:
         if not isinstance(entry, dict) or str(entry.get("n", "")).strip() != symbol:
             continue
         values = entry.get("v")
         if not isinstance(values, dict):
-            break
+            diagnostics.append("quote_values_missing")
+            continue
         try:
             price = float(values.get("lp"))
-            timestamp_value = values.get("tt", values.get("timestamp"))
+        except (TypeError, ValueError, OverflowError):
+            diagnostics.append(f"ltp_invalid(value={values.get('lp')!r})")
+            continue
+        timestamp_value = values.get("tt", values.get("timestamp"))
+        if timestamp_value is None:
+            diagnostics.append(
+                f"quote_timestamp_missing(fields={sorted(str(key) for key in values)})"
+            )
+            continue
+        try:
             quote_timestamp = float(timestamp_value)
         except (TypeError, ValueError, OverflowError):
-            break
+            diagnostics.append(f"quote_timestamp_invalid(value={timestamp_value!r})")
+            continue
         if not math.isfinite(quote_timestamp) or quote_timestamp <= 0:
-            break
+            diagnostics.append(f"quote_timestamp_out_of_range(value={timestamp_value!r})")
+            continue
         if quote_timestamp > 10**12:
             quote_timestamp /= 1000
         try:
             quoted_at = datetime.fromtimestamp(quote_timestamp, tz=IST)
         except (OverflowError, OSError, ValueError):
-            break
+            diagnostics.append(f"quote_timestamp_unparseable(value={timestamp_value!r})")
+            continue
         age = (now.astimezone(IST) - quoted_at).total_seconds()
-        if not math.isfinite(price) or price <= 0 or age < -30 or age > 60:
-            break
+        if not math.isfinite(price) or price <= 0:
+            diagnostics.append(f"ltp_out_of_range(value={values.get('lp')!r})")
+            continue
+        if age < -30:
+            diagnostics.append(
+                f"quote_timestamp_in_future(age_seconds={age:.1f}, value={timestamp_value!r})"
+            )
+            continue
+        if age > 60:
+            diagnostics.append(
+                f"quote_stale(age_seconds={age:.1f}, max_age_seconds=60, "
+                f"value={timestamp_value!r})"
+            )
+            continue
         return price
-    raise FyersAPIError(f"Fyers did not return a fresh, valid quote for {symbol}.")
+    reason = "; ".join(diagnostics) if diagnostics else "symbol_not_returned"
+    LOGGER.warning(
+        "EMA9 option quote rejected symbol=%s reason=%s returned_symbols=%s "
+        "requested_at=%s response_status=%r",
+        symbol,
+        reason,
+        returned_symbols,
+        now.astimezone(IST).isoformat(),
+        response.get("s"),
+    )
+    raise FyersQuoteError(
+        f"Fyers did not return a fresh, valid quote for {symbol} ({reason})."
+    )
 
 
 class EMA9ForwardRunner:
@@ -1330,6 +1397,31 @@ def _run_forward_runner(
                 last_market_data_at = now
                 minute_bars = pd.concat([warmup_bars, current_bars], ignore_index=True)
                 runner.process_market_data(minute_bars, now=now)
+            except FyersQuoteError as exc:
+                market_data_status = "OPTION QUOTE ERROR"
+                dashboard_state.update_market(status="ERROR")
+                LOGGER.warning(
+                    "%s EMA9 option quote unavailable; no entry was submitted and "
+                    "the runner will retry. detail=%s",
+                    config.name,
+                    exc,
+                )
+                _notify_runner_error(
+                    notifier,
+                    "Option quote unavailable; entry skipped and retried",
+                    exc,
+                    instrument=config.name,
+                    mode=mode,
+                )
+                try:
+                    runner.check_open_position_risk(now=now)
+                    runner.send_end_of_day_report(now=now)
+                except FyersAPIError as risk_error:
+                    LOGGER.warning(
+                        "%s EMA9 position risk could not be marked during quote recovery: %s",
+                        config.name,
+                        risk_error,
+                    )
             except FyersAPIError as exc:
                 market_data_status = "ERROR · market-data request failed"
                 dashboard_state.update_market(status="ERROR")

@@ -10,6 +10,7 @@ from Dependencies.fyers_dashboard_state import FyersDashboardState
 from Dependencies.fyers_ema9_forward_launcher import selected_instrument
 from Dependencies.fyers_ema9_forward_runner import (
     EMA9ForwardRunner,
+    FyersQuoteError,
     ForwardPosition,
     InstrumentConfig,
     _create_telegram_notifier,
@@ -249,8 +250,45 @@ def test_quote_reader_rejects_missing_or_stale_quote_timestamps():
         ]
     }
 
-    with pytest.raises(FyersAPIError, match="fresh, valid quote"):
+    with pytest.raises(FyersQuoteError, match="quote_stale"):
         _quote_ltp(QuoteApi(stale), "NSE:OPTION", now=now)
+
+
+def test_quote_reader_logs_when_requested_symbol_is_not_returned(caplog):
+    class QuoteApi:
+        def quotes(self, _symbols):
+            return {
+                "s": "ok",
+                "d": [
+                    {
+                        "n": "BSE:OTHER-OPTION",
+                        "v": {"lp": 100, "tt": datetime(2026, 10, 9, 9, 59, tzinfo=IST).timestamp()},
+                    }
+                ],
+            }
+
+    now = datetime(2026, 10, 9, 10, 0, tzinfo=IST)
+    with pytest.raises(FyersQuoteError, match="symbol_not_returned"):
+        _quote_ltp(QuoteApi(), "BSE:SENSEX-OPTION", now=now)
+
+    assert "reason=symbol_not_returned" in caplog.text
+    assert "BSE:OTHER-OPTION" in caplog.text
+
+
+def test_quote_reader_logs_fyers_request_failure(caplog):
+    class QuoteApi:
+        def quotes(self, _symbols):
+            raise FyersAPIError("Fyers /quotes returned HTTP 429.")
+
+    with pytest.raises(FyersQuoteError, match="HTTP 429"):
+        _quote_ltp(
+            QuoteApi(),
+            "NSE:NIFTY-OPTION",
+            now=datetime(2026, 10, 9, 10, 0, tzinfo=IST),
+        )
+
+    assert "EMA9 option quote request failed" in caplog.text
+    assert "HTTP 429" in caplog.text
 
 
 def test_quote_reader_returns_fresh_ltp():
