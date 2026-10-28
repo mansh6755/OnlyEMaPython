@@ -17,7 +17,7 @@ from Dependencies.fyers_ema9_forward_runner import (
     _format_health_alert,
     _is_market_data_session,
     _latest_trading_day,
-    _quote_ltp,
+    _quote_option_price,
     _validate_live_resume,
     execution_mode_from_environment,
     select_itm_contract,
@@ -251,7 +251,61 @@ def test_quote_reader_rejects_missing_or_stale_quote_timestamps():
     }
 
     with pytest.raises(FyersQuoteError, match="quote_stale"):
-        _quote_ltp(QuoteApi(stale), "NSE:OPTION", now=now)
+        _quote_option_price(QuoteApi(stale), "NSE:OPTION", now=now)
+
+
+@pytest.mark.parametrize(("side", "expected"), [("BUY", 101.0), ("SELL", 99.0)])
+def test_quote_reader_uses_executable_order_book_side_when_ltp_is_stale(side, expected):
+    class QuoteApi:
+        def quotes(self, _symbols):
+            return {
+                "s": "ok",
+                "d": [
+                    {
+                        "n": "NSE:OPTION",
+                        "v": {
+                            "lp": 100,
+                            "tt": datetime(2026, 10, 9, 9, 58, tzinfo=IST).timestamp(),
+                            "bid": 99,
+                            "ask": 101,
+                        },
+                    }
+                ],
+            }
+
+    price = _quote_option_price(
+        QuoteApi(),
+        "NSE:OPTION",
+        now=datetime(2026, 10, 9, 10, 0, tzinfo=IST),
+        side=side,
+    )
+
+    assert price == expected
+
+
+def test_quote_reader_rejects_stale_ltp_with_invalid_order_book():
+    class QuoteApi:
+        def quotes(self, _symbols):
+            return {
+                "d": [
+                    {
+                        "n": "NSE:OPTION",
+                        "v": {
+                            "lp": 100,
+                            "tt": datetime(2026, 10, 9, 9, 58, tzinfo=IST).timestamp(),
+                            "bid": 101,
+                            "ask": 99,
+                        },
+                    }
+                ]
+            }
+
+    with pytest.raises(FyersQuoteError, match="order_book_invalid"):
+        _quote_option_price(
+            QuoteApi(),
+            "NSE:OPTION",
+            now=datetime(2026, 10, 9, 10, 0, tzinfo=IST),
+        )
 
 
 def test_quote_reader_logs_when_requested_symbol_is_not_returned(caplog):
@@ -269,7 +323,7 @@ def test_quote_reader_logs_when_requested_symbol_is_not_returned(caplog):
 
     now = datetime(2026, 10, 9, 10, 0, tzinfo=IST)
     with pytest.raises(FyersQuoteError, match="symbol_not_returned"):
-        _quote_ltp(QuoteApi(), "BSE:SENSEX-OPTION", now=now)
+        _quote_option_price(QuoteApi(), "BSE:SENSEX-OPTION", now=now)
 
     assert "reason=symbol_not_returned" in caplog.text
     assert "BSE:OTHER-OPTION" in caplog.text
@@ -281,7 +335,7 @@ def test_quote_reader_logs_fyers_request_failure(caplog):
             raise FyersAPIError("Fyers /quotes returned HTTP 429.")
 
     with pytest.raises(FyersQuoteError, match="HTTP 429"):
-        _quote_ltp(
+        _quote_option_price(
             QuoteApi(),
             "NSE:NIFTY-OPTION",
             now=datetime(2026, 10, 9, 10, 0, tzinfo=IST),
@@ -306,7 +360,7 @@ def test_quote_reader_returns_fresh_ltp():
                 ]
             }
 
-    assert _quote_ltp(
+    assert _quote_option_price(
         QuoteApi(), "NSE:OPTION", now=datetime(2026, 10, 9, 10, 0, tzinfo=IST)
     ) == 101.25
 

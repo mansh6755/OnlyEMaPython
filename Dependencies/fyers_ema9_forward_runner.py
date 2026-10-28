@@ -387,7 +387,43 @@ def _create_telegram_notifier(environment: dict[str, str]) -> TelegramNotifier:
     return TelegramNotifier(bot_token, chat_id, enabled=True)
 
 
-def _quote_ltp(api: FyersAPI, symbol: str, *, now: datetime) -> float:
+def _quote_option_price(
+    api: FyersAPI,
+    symbol: str,
+    *,
+    now: datetime,
+    side: str = "BUY",
+) -> float:
+    quote_side = side.strip().upper()
+    if quote_side not in {"BUY", "SELL"}:
+        raise ValueError("Quote side must be BUY or SELL.")
+
+    def book_side_price(values: dict[str, Any], reason: str) -> float | None:
+        try:
+            bid = float(values.get("bid"))
+            ask = float(values.get("ask"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not (
+            math.isfinite(bid)
+            and math.isfinite(ask)
+            and 0 < bid <= ask
+        ):
+            diagnostics.append(
+                f"order_book_invalid(bid={values.get('bid')!r}, ask={values.get('ask')!r})"
+            )
+            return None
+        price = ask if quote_side == "BUY" else bid
+        LOGGER.warning(
+            "EMA9 option quote using REST order-book side symbol=%s side=%s "
+            "price=%.2f rejected_ltp_reason=%s",
+            symbol,
+            quote_side,
+            price,
+            reason,
+        )
+        return price
+
     try:
         response = api.quotes([symbol])
     except FyersAPIError as exc:
@@ -428,32 +464,54 @@ def _quote_ltp(api: FyersAPI, symbol: str, *, now: datetime) -> float:
         try:
             price = float(values.get("lp"))
         except (TypeError, ValueError, OverflowError):
-            diagnostics.append(f"ltp_invalid(value={values.get('lp')!r})")
+            reason = f"ltp_invalid(value={values.get('lp')!r})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         timestamp_value = values.get("tt", values.get("timestamp"))
         if timestamp_value is None:
-            diagnostics.append(
-                f"quote_timestamp_missing(fields={sorted(str(key) for key in values)})"
-            )
+            reason = f"quote_timestamp_missing(fields={sorted(str(key) for key in values)})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         try:
             quote_timestamp = float(timestamp_value)
         except (TypeError, ValueError, OverflowError):
-            diagnostics.append(f"quote_timestamp_invalid(value={timestamp_value!r})")
+            reason = f"quote_timestamp_invalid(value={timestamp_value!r})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         if not math.isfinite(quote_timestamp) or quote_timestamp <= 0:
-            diagnostics.append(f"quote_timestamp_out_of_range(value={timestamp_value!r})")
+            reason = f"quote_timestamp_out_of_range(value={timestamp_value!r})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         if quote_timestamp > 10**12:
             quote_timestamp /= 1000
         try:
             quoted_at = datetime.fromtimestamp(quote_timestamp, tz=IST)
         except (OverflowError, OSError, ValueError):
-            diagnostics.append(f"quote_timestamp_unparseable(value={timestamp_value!r})")
+            reason = f"quote_timestamp_unparseable(value={timestamp_value!r})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         age = (now.astimezone(IST) - quoted_at).total_seconds()
         if not math.isfinite(price) or price <= 0:
-            diagnostics.append(f"ltp_out_of_range(value={values.get('lp')!r})")
+            reason = f"ltp_out_of_range(value={values.get('lp')!r})"
+            diagnostics.append(reason)
+            fallback = book_side_price(values, reason)
+            if fallback is not None:
+                return fallback
             continue
         if age < -30:
             diagnostics.append(
@@ -465,8 +523,11 @@ def _quote_ltp(api: FyersAPI, symbol: str, *, now: datetime) -> float:
                 f"quote_stale(age_seconds={age:.1f}, max_age_seconds=60, "
                 f"value={timestamp_value!r})"
             )
-            continue
-        return price
+            fallback = book_side_price(values, diagnostics[-1])
+            if fallback is not None:
+                return fallback
+        else:
+            return price
     reason = "; ".join(diagnostics) if diagnostics else "symbol_not_returned"
     LOGGER.warning(
         "EMA9 option quote rejected symbol=%s reason=%s returned_symbols=%s "
@@ -687,11 +748,15 @@ class EMA9ForwardRunner:
             fallback_price = quote_price
         elif self.mode == "LIVE":
             try:
-                fallback_price = _quote_ltp(self.api, position.contract.symbol, now=at)
+                fallback_price = _quote_option_price(
+                    self.api, position.contract.symbol, now=at, side="SELL"
+                )
             except FyersAPIError:
                 fallback_price = position.entry_option_price
         else:
-            fallback_price = _quote_ltp(self.api, position.contract.symbol, now=at)
+            fallback_price = _quote_option_price(
+                self.api, position.contract.symbol, now=at, side="SELL"
+            )
         if self.mode == "LIVE":
             exit_price = self._place_order(
                 symbol=position.contract.symbol,
@@ -794,7 +859,7 @@ class EMA9ForwardRunner:
             trade_day=bar_close.date(),
             config=self.config,
         )
-        quote = _quote_ltp(self.api, contract.symbol, now=quote_at)
+        quote = _quote_option_price(self.api, contract.symbol, now=quote_at, side="BUY")
         quantity = contract.lot_size
         entry_price = quote
         if self.mode == "LIVE":
@@ -872,7 +937,9 @@ class EMA9ForwardRunner:
             )
             return
         try:
-            mark = _quote_ltp(self.api, position.contract.symbol, now=now)
+            mark = _quote_option_price(
+                self.api, position.contract.symbol, now=now, side="SELL"
+            )
         except FyersAPIError:
             if self.mode != "LIVE":
                 raise
