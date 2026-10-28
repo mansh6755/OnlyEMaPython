@@ -43,13 +43,23 @@ Error details are redacted and repeated errors are rate-limited.
 The web dashboard identifies the active NIFTY or SENSEX EMA9 runner and links
 to a separate date-range backtest page. The dashboard and backtest action are
 public to anyone who can reach its URL. Backtests can be submitted outside the
-weekday 9:15 AM–3:20 PM IST market session so historical requests do not
-compete with live market polling. Backtests use one lot, two strikes ITM, the ₹3,500
+weekday 9:15 AM–3:20 PM IST market session, except during the overnight pause
+after square-off until the next weekday 9:00 AM IST, so historical requests do
+not compete with live market polling. Backtests use one lot, two strikes ITM, the ₹3,500
 daily option loss cap, and historical Fyers index/option candles. Results show
 the trade list and summary; P&L excludes brokerage, taxes, bid-ask spread, and
 slippage. Both date fields default to the latest date for which Fyers has index
 candles, so weekends and exchange holidays resolve to the preceding trading
 session. Only one dashboard backtest runs at a time.
+
+After square-off and the end-of-day report, the runner clears saved Fyers
+tokens, strategy state, trade CSV history, dashboard snapshots, and in-memory
+contract data; it closes the Fyers HTTP session and blocks Fyers requests. It
+then sleeps until the next weekday 9:00 AM IST authentication slot. Strategy
+state and trade history are intentionally deleted at this point. The Telegram
+authentication listener remains active overnight; before it sends the morning
+authorization link, it clears saved tokens again. This runner does not maintain
+a Fyers WebSocket connection.
 
 To enable live orders, set `EMA9_EXECUTION_MODE=LIVE`; leaving it unset or set to
 `PAPER` keeps this runner paper-only. This is the sole execution-mode switch for

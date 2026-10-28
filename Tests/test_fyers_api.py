@@ -28,10 +28,14 @@ class _Session:
     def __init__(self, response):
         self.response = response
         self.last_request = None
+        self.closed = False
 
     def request(self, *args, **kwargs):
         self.last_request = (args, kwargs)
         return self.response
+
+    def close(self):
+        self.closed = True
 
 
 def test_quote_ltp_reads_the_requested_fyers_symbol():
@@ -224,6 +228,37 @@ def test_clear_access_token_removes_active_token_and_environment(monkeypatch):
     assert api.access_token == ""
     assert api._headers["Authorization"] == "app-100:"
     assert "FYERS_ACCESS_TOKEN" not in os.environ
+
+
+def test_fyers_http_requests_can_be_paused_and_resumed():
+    session = _Session(_Response({"s": "ok"}))
+    api = FyersAPI("app-100", "test-token", session=session)
+    api.disable_requests()
+
+    with pytest.raises(FyersAPIError, match="disabled during the overnight pause"):
+        api._request("GET", "https://example.test", "/history")
+    assert session.last_request is None
+
+    api.enable_requests()
+    assert api._request("GET", "https://example.test", "/history") == {"s": "ok"}
+
+
+def test_option_master_requests_are_paused_and_cache_can_be_cleared():
+    class MasterSession(_Session):
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("A disabled Fyers client must not download the option master.")
+
+    session = MasterSession(_Response({"s": "ok"}))
+    api = FyersAPI("app-100", "test-token", session=session)
+    api._option_master_cache["NSE"] = [{"symbol": "NSE:OPTION"}]
+    api.disable_requests()
+
+    with pytest.raises(FyersAPIError, match="disabled during the overnight pause"):
+        api.option_master("NSE")
+
+    api.clear_cache()
+    assert api._option_master_cache == {}
+    assert session.closed
 
 
 def test_validate_session_raises_when_fyers_rejects_session():

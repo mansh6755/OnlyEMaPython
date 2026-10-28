@@ -32,3 +32,24 @@ def test_dashboard_state_position_can_be_cleared():
     state.set_position(None)
 
     assert state.snapshot()["position"] is None
+
+
+def test_dashboard_state_clears_cached_market_and_trade_data():
+    state = FyersDashboardState()
+    state.update_market(candles=[{"time": 1}], spot=24000.0)
+    state.update_account(realized_pnl=50.0, open_pnl=10.0, total_pnl=60.0, trade_count=1)
+    state.set_position({"direction": "LONG", "symbol": "NIFTY-CE"})
+    state.record_trade({"symbol": "NIFTY-CE", "pnl": 50.0})
+    state.record_event({"message": "market data received"})
+
+    state.clear_cached_data(market_status="OVERNIGHT")
+
+    snapshot = state.snapshot()
+    assert snapshot["market"]["status"] == "OVERNIGHT"
+    assert snapshot["market"]["candles"] == []
+    assert snapshot["market"]["spot"] is None
+    assert snapshot["account"]["realized_pnl"] == 0.0
+    assert snapshot["account"]["open_pnl"] is None
+    assert snapshot["position"] is None
+    assert snapshot["trades"] == []
+    assert snapshot["events"] == []

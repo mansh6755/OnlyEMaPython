@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import tempfile
+import threading
 import time as sleep_time
 import traceback
 import uuid
@@ -43,7 +44,9 @@ from Dependencies.secret_redaction import environment_secrets, redact_text  # no
 from Dependencies.fyers_telegram_auth import (  # noqa: E402
     ENV_FILE,
     FyersTelegramAuthService,
+    clear_saved_access_tokens,
     load_persisted_access_token,
+    next_daily_authentication_at,
 )
 from Dependencies.telegram_notifier import TelegramNotifier  # noqa: E402
 
@@ -823,7 +826,9 @@ class EMA9ForwardRunner:
             self.dashboard_state.record_trade(
                 {
                     "exit_time": trade["exit_time"],
-                    "direction": direction,
+                    "direction": (
+                        "LONG" if position.signal == "ENTER_LONG" else "SHORT"
+                    ),
                     "display_symbol": position.contract.symbol,
                     "symbol": position.contract.symbol,
                     "quantity": position.quantity,
@@ -1279,6 +1284,36 @@ def _validate_live_resume(runner: EMA9ForwardRunner, *, now: datetime) -> None:
         )
 
 
+def _clear_overnight_caches(
+    *,
+    api: FyersAPI,
+    auth_service: FyersTelegramAuthService,
+    runner: EMA9ForwardRunner,
+    dashboard_state: FyersDashboardState,
+    environment: dict[str, str],
+) -> None:
+    if runner.position is not None:
+        raise RuntimeError("Cannot clear overnight state while an option position is open.")
+    api.disable_requests()
+    api.clear_access_token()
+    api.clear_cache()
+    clear_saved_access_tokens(auth_service.token_file, ENV_FILE)
+    environment.pop("FYERS_ACCESS_TOKEN", None)
+    runner.state_path.unlink(missing_ok=True)
+    runner.trades_path.unlink(missing_ok=True)
+    dashboard_state.clear_cached_data(market_status="OVERNIGHT")
+
+
+def _sleep_until_authentication(scheduled_at: datetime) -> datetime:
+    sleep_seconds = max(0.0, (scheduled_at - datetime.now(IST)).total_seconds())
+    LOGGER.info(
+        "EMA9 runner entering overnight sleep until %s; Fyers HTTP requests are disabled.",
+        scheduled_at.isoformat(),
+    )
+    sleep_time.sleep(sleep_seconds)
+    return scheduled_at
+
+
 def run_forward_runner(config: InstrumentConfig) -> None:
     load_dotenv(ENV_FILE, override=False)
     environment = dict(os.environ)
@@ -1340,9 +1375,11 @@ def _run_forward_runner(
     access_token = load_persisted_access_token(
         token_file, environment.get("FYERS_ACCESS_TOKEN", "")
     )
+    environment.pop("FYERS_ACCESS_TOKEN", None)
     api = FyersAPI(app_id, access_token or "telegram-auth-pending")
     signal_logic = _load_signal_logic()
     dashboard_state = FyersDashboardState()
+    overnight_pause = threading.Event()
     dashboard_enabled = environment.get("DASHBOARD_ENABLED", "true").strip().lower() == "true"
     dashboard_state.update_service(
         status="STARTING",
@@ -1353,6 +1390,8 @@ def _run_forward_runner(
     )
 
     def run_dashboard_backtest_for_range(start: date, end: date) -> dict[str, Any]:
+        if overnight_pause.is_set():
+            raise RuntimeError("Dashboard backtests are paused during the overnight rest.")
         return run_dashboard_backtest(
             api,
             signal_logic,
@@ -1363,6 +1402,8 @@ def _run_forward_runner(
         )
 
     def get_latest_trading_day() -> date:
+        if overnight_pause.is_set():
+            raise RuntimeError("Fyers date lookup is paused during the overnight rest.")
         return _latest_trading_day(
             api, config.index_symbol, today=datetime.now(IST).date()
         )
@@ -1397,6 +1438,7 @@ def _run_forward_runner(
     auth_service.start()
     try:
         auth_service.authenticate_startup(has_access_token=bool(access_token))
+        del access_token
         if mode == "LIVE":
             _live_preflight(execution, runner)
             _validate_live_resume(runner, now=datetime.now(IST))
@@ -1429,8 +1471,101 @@ def _run_forward_runner(
         )
         warmup_day: date | None = None
         warmup_bars = pd.DataFrame()
+        overnight_wake_at: datetime | None = None
+        overnight_completed_for: date | None = None
         while True:
             now = datetime.now(IST)
+            if (
+                runner.eod_report_sent
+                and runner.trading_day is not None
+                and overnight_completed_for != runner.trading_day
+                and overnight_wake_at is None
+            ):
+                overnight_pause.set()
+                overnight_wake_at = (
+                    next_daily_authentication_at(now)
+                    if runner.trading_day == now.date()
+                    else now
+                )
+            if (
+                now.time() >= SQUARE_OFF
+                and runner.trading_day == now.date()
+                and not runner.eod_report_sent
+            ):
+                try:
+                    runner.check_open_position_risk(now=now)
+                    runner.send_end_of_day_report(now=now)
+                    if runner.eod_report_sent:
+                        overnight_pause.set()
+                except FyersAPIError as exc:
+                    LOGGER.exception(
+                        "%s EMA9 could not complete square-off; retrying before overnight pause.",
+                        config.name,
+                    )
+                    _notify_runner_error(
+                        notifier,
+                        "Square-off failed; retrying before overnight pause",
+                        exc,
+                        instrument=config.name,
+                        mode=mode,
+                    )
+                    sleep_time.sleep(poll_seconds)
+                    continue
+                except Exception as exc:
+                    LOGGER.exception(
+                        "%s EMA9 could not complete square-off; retrying before overnight pause.",
+                        config.name,
+                    )
+                    _notify_runner_error(
+                        notifier,
+                        "Square-off failed; retrying before overnight pause",
+                        exc,
+                        instrument=config.name,
+                        mode=mode,
+                    )
+                    sleep_time.sleep(poll_seconds)
+                    continue
+            if (
+                runner.eod_report_sent
+                and runner.trading_day is not None
+                and overnight_completed_for != runner.trading_day
+            ):
+                try:
+                    _clear_overnight_caches(
+                        api=api,
+                        auth_service=auth_service,
+                        runner=runner,
+                        dashboard_state=dashboard_state,
+                        environment=environment,
+                    )
+                except (OSError, RuntimeError, UnicodeError) as exc:
+                    LOGGER.exception(
+                        "%s EMA9 overnight cache cleanup failed; retrying without Fyers requests.",
+                        config.name,
+                    )
+                    _notify_runner_error(
+                        notifier,
+                        "Overnight cache cleanup failed; retrying",
+                        exc,
+                        instrument=config.name,
+                        mode=mode,
+                    )
+                    sleep_time.sleep(30)
+                    continue
+                warmup_day = None
+                warmup_bars = pd.DataFrame()
+                dashboard_state.update_service(status="SLEEPING UNTIL NEXT 09:00 IST")
+                scheduled_at = overnight_wake_at or next_daily_authentication_at(now)
+                _sleep_until_authentication(scheduled_at)
+                api.enable_requests()
+                overnight_completed_for = runner.trading_day
+                overnight_wake_at = None
+                overnight_pause.clear()
+                next_health_at = scheduled_at + HEALTH_ALERT_INTERVAL
+                market_data_status = "WAITING FOR FIRST FETCH"
+                last_market_data_at = None
+                dashboard_state.update_service(status="WAITING FOR MARKET OPEN")
+                continue
             if not _is_market_data_session(now):
                 sleep_time.sleep(poll_seconds)
                 continue
@@ -1521,6 +1656,8 @@ def _run_forward_runner(
                 )
                 if mode == "LIVE":
                     raise
+            if runner.eod_report_sent and runner.trading_day == now.date():
+                overnight_pause.set()
             sleep_delta = poll_seconds - (datetime.now(IST) - now).total_seconds()
             sleep_time.sleep(max(0.0, sleep_delta))
     finally:

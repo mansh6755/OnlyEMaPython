@@ -20,10 +20,14 @@ class _FakeMarketDataClient:
         self.installed_token: str | None = None
         self.active_token = "active-token"
         self.session_valid = True
+        self.requests_enabled = True
 
     def clear_access_token(self) -> None:
         self.active_token = ""
         os.environ.pop("FYERS_ACCESS_TOKEN", None)
+
+    def enable_requests(self) -> None:
+        self.requests_enabled = True
 
     def replace_access_token(self, token: str, *, persist) -> None:
         persist(token)
@@ -163,10 +167,12 @@ def test_authorization_clears_saved_and_active_token_before_notifying(tmp_path, 
         assert service.market_data_client.active_token == ""
 
     service._notify = capture_notification
+    service.market_data_client.requests_enabled = False
 
     service.request_authorization("Daily Fyers authentication")
 
     assert len(notifications) == 1
+    assert service.market_data_client.requests_enabled is False
     service._httpd.server_close()
 
 

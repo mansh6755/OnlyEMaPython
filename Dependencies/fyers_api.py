@@ -10,6 +10,7 @@ import time as sleep_time
 from collections.abc import Callable
 from datetime import date, datetime, time
 from io import StringIO
+from threading import RLock
 from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -161,6 +162,25 @@ class FyersAPI:
         }
         self._option_master_cache: dict[str, list[dict[str, Any]]] = {}
         self._last_get_started = 0.0
+        self._requests_enabled = True
+        self._request_lock = RLock()
+
+    def enable_requests(self) -> None:
+        """Allow Fyers HTTP requests after an overnight trading pause."""
+        with self._request_lock:
+            self._requests_enabled = True
+
+    def disable_requests(self) -> None:
+        """Block Fyers HTTP requests until authentication or the next session."""
+        with self._request_lock:
+            self._requests_enabled = False
+
+    def clear_cache(self) -> None:
+        """Drop in-memory contract data and close pooled HTTP connections."""
+        with self._request_lock:
+            self._option_master_cache.clear()
+            self._last_get_started = 0.0
+            self.session.close()
 
     def replace_access_token(self, token: str, *, persist: Callable[[str], None]) -> None:
         refreshed_token = str(token).strip()
@@ -197,6 +217,28 @@ class FyersAPI:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        with self._request_lock:
+            return self._request_locked(
+                method,
+                base_url,
+                path,
+                params=params,
+                payload=payload,
+            )
+
+    def _request_locked(
+        self,
+        method: str,
+        base_url: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self._requests_enabled and not (
+            base_url == API_BASE and path == "/profile"
+        ):
+            raise FyersAPIError("Fyers requests are disabled during the overnight pause.")
         response = None
         for attempt in range(6):
             if method.upper() == "GET":
@@ -366,23 +408,26 @@ class FyersAPI:
         master_urls = {"NSE": NSE_FO_MASTER_URL, "BSE": BSE_FO_MASTER_URL}
         if exchange_code not in master_urls:
             raise ValueError("exchange must be NSE or BSE.")
-        if exchange_code in self._option_master_cache:
-            return self._option_master_cache[exchange_code]
-        try:
-            response = self.session.get(master_urls[exchange_code], timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise FyersAPIError(
-                f"Unable to download the Fyers {exchange_code} derivatives master."
-            ) from exc
+        with self._request_lock:
+            if not self._requests_enabled:
+                raise FyersAPIError("Fyers requests are disabled during the overnight pause.")
+            if exchange_code in self._option_master_cache:
+                return self._option_master_cache[exchange_code]
+            try:
+                response = self.session.get(master_urls[exchange_code], timeout=self.timeout)
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                raise FyersAPIError(
+                    f"Unable to download the Fyers {exchange_code} derivatives master."
+                ) from exc
 
-        rows = parse_fyers_fo_master(response.text)
-        if not rows:
-            raise FyersAPIError(
-                f"Fyers {exchange_code} derivatives master contained no usable contracts."
-            )
-        self._option_master_cache[exchange_code] = rows
-        return rows
+            rows = parse_fyers_fo_master(response.text)
+            if not rows:
+                raise FyersAPIError(
+                    f"Fyers {exchange_code} derivatives master contained no usable contracts."
+                )
+            self._option_master_cache[exchange_code] = rows
+            return rows
 
     def resolve_next_week_option(
         self,

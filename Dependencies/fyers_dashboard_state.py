@@ -95,6 +95,38 @@ class FyersDashboardState:
         with self._lock:
             return deepcopy(self._snapshot)
 
+    def clear_cached_data(self, *, market_status: str = "WAITING") -> None:
+        with self._lock:
+            market = self._snapshot["market"]
+            market.update(
+                {
+                    "status": market_status,
+                    "last_success_at": None,
+                    "bar_at": None,
+                    "spot": None,
+                    "ema_fast": None,
+                    "ema_mid": None,
+                    "ema_slow": None,
+                    "atr": None,
+                    "adx": None,
+                    "candles": [],
+                }
+            )
+            self._snapshot["account"].update(
+                {
+                    "realized_pnl": 0.0,
+                    "open_pnl": None,
+                    "total_pnl": 0.0,
+                    "trade_count": 0,
+                    "daily_loss_limit": None,
+                }
+            )
+            self._snapshot["position"] = None
+            self._snapshot["signal"] = {"action": "HOLD", "status": "WAITING", "at": None}
+            self._snapshot["trades"] = []
+            self._snapshot["events"] = []
+            self._touch()
+
     def _touch(self) -> None:
         self._snapshot["service"]["updated_at"] = datetime.now().astimezone().isoformat(
             timespec="seconds"

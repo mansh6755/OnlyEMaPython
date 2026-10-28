@@ -1,10 +1,11 @@
+import os
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
-from Dependencies.fyers_api import FyersAPIError
+from Dependencies.fyers_api import FyersAPI, FyersAPIError
 from Dependencies.broker_contract import OrderStatus
 from Dependencies.fyers_dashboard_state import FyersDashboardState
 from Dependencies.fyers_ema9_forward_launcher import selected_instrument
@@ -14,6 +15,7 @@ from Dependencies.fyers_ema9_forward_runner import (
     ForwardPosition,
     InstrumentConfig,
     _create_telegram_notifier,
+    _clear_overnight_caches,
     _format_health_alert,
     _is_market_data_session,
     _latest_trading_day,
@@ -577,11 +579,59 @@ def test_end_of_day_report_contains_trade_count_pnl_and_is_sent_once(tmp_path):
     assert runner.eod_report_sent is True
 
 
+def test_overnight_cleanup_removes_tokens_and_strategy_caches(tmp_path, monkeypatch):
+    class Session:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    api_session = Session()
+    api = FyersAPI("app-id", "old-token", session=api_session)
+    runner = _forward_runner(tmp_path, api, _NoOrderExecution())
+    runner._save_state()
+    runner.trades_path.write_text("trade history\n", encoding="utf-8")
+    token_file = tmp_path / "token"
+    token_file.write_text("old-token", encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("FYERS_ACCESS_TOKEN=old-token\nOTHER_SETTING=keep\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "Dependencies.fyers_ema9_forward_runner.ENV_FILE", env_file
+    )
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "old-token")
+    environment = {"FYERS_ACCESS_TOKEN": "old-token"}
+    dashboard_state = FyersDashboardState()
+    dashboard_state.update_market(candles=[{"time": 1}], spot=24000.0)
+    auth_service = type("AuthService", (), {"token_file": token_file})()
+
+    _clear_overnight_caches(
+        api=api,
+        auth_service=auth_service,
+        runner=runner,
+        dashboard_state=dashboard_state,
+        environment=environment,
+    )
+
+    assert not token_file.exists()
+    assert not runner.state_path.exists()
+    assert not runner.trades_path.exists()
+    assert env_file.read_text(encoding="utf-8") == "OTHER_SETTING=keep\n"
+    assert "FYERS_ACCESS_TOKEN" not in os.environ
+    assert "FYERS_ACCESS_TOKEN" not in environment
+    assert api.access_token == ""
+    assert api._requests_enabled is False
+    assert api_session.closed
+    assert dashboard_state.snapshot()["market"]["candles"] == []
+
+
 def test_minute_touch_exit_uses_prior_completed_ema9_before_five_minute_close(tmp_path):
     now = datetime(2026, 10, 8, 10, 7, tzinfo=IST)
     api = _FakeApi(quote_timestamp=now.timestamp())
     execution = _NoOrderExecution()
-    runner = _forward_runner(tmp_path, api, execution)
+    dashboard_state = FyersDashboardState()
+    runner = _forward_runner(
+        tmp_path, api, execution, dashboard_state=dashboard_state
+    )
     runner.trading_day = now.date()
     runner.last_processed_minute = pd.Timestamp(datetime(2026, 10, 8, 10, 4, tzinfo=IST))
     runner.last_processed_bar = pd.Timestamp(datetime(2026, 10, 8, 10, 0, tzinfo=IST))
@@ -620,6 +670,7 @@ def test_minute_touch_exit_uses_prior_completed_ema9_before_five_minute_close(tm
     assert runner.position is None
     assert "EMA9_TOUCH" in (tmp_path / "trades.csv").read_text()
     assert execution.orders == []
+    assert dashboard_state.snapshot()["trades"][0]["direction"] == "LONG"
 
 
 def test_live_runner_closes_when_option_quote_becomes_stale(tmp_path):
